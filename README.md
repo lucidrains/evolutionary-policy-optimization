@@ -2,7 +2,7 @@
 
 ## Evolutionary Policy Optimization (wip)
 
-Pytorch implementation of [Evolutionary Policy Optimization](https://web3.arxiv.org/abs/2503.19037), from Wang et al. out of Robotics Institute at Carnegie Melon
+Pytorch implementation of [Evolutionary Policy Optimization](https://web3.arxiv.org/abs/2503.19037), from Wang et al. of the Robotics Institute at Carnegie Mellon University
 
 ## Citations
 
