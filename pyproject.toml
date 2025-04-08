@@ -34,7 +34,11 @@ Homepage = "https://pypi.org/project/evolutionary-policy-optimization/"
 Repository = "https://github.com/lucidrains/evolutionary-policy-optimization"
 
 [project.optional-dependencies]
-examples = ["tqdm", "numpy"]
+examples = [
+    "numpy",
+    "pufferlib>=2.0.6",
+    "tqdm",
+]
 
 [build-system]
 requires = ["hatchling"]
