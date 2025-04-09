@@ -18,3 +18,5 @@ Besides their latent variable method, I'll also throw in some attempts with cros
     url   = {https://api.semanticscholar.org/CorpusID:277313729}
 }
 ```
+
+*Evolution is cleverer than you are.* - Leslie Orgel
