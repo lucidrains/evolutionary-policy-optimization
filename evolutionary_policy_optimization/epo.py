@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from torch import cat
+from torch import nn, cat
 
 import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleList
@@ -58,6 +58,11 @@ class MLP(Module):
         self.dim_latent = dim_latent
         self.needs_latent = dim_latent > 0
 
+        self.encode_latent = nn.Sequential(
+            Linear(dim_latent, dim_latent),
+            nn.SiLU()
+        ) if self.needs_latent else None
+
         # pairs of dimension
 
         dim_pairs = tuple(zip(dims[:-1], dims[1:]))
@@ -80,6 +85,8 @@ class MLP(Module):
             # but will also offer some alternatives once a spark is seen (film, adaptive linear from stylegan, etc)
 
             batch = x.shape[0]
+
+            latent = self.encode_latent(latent)
             latent = repeat(latent, 'd -> b d', b = batch)
 
             x = cat((x, latent), dim = -1)
