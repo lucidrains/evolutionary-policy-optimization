@@ -20,7 +20,7 @@ def xnor(x, y):
 def l2norm(t):
     return F.normalize(t, p = 2, dim = -1)
 
-# crossover
+# evolution related functions
 
 def crossover_weights(w1, w2):
     assert w2.shape == w2.shape
@@ -60,6 +60,20 @@ def crossover_latents(
         return child
 
     return l2norm(child)
+
+def mutation(
+    latents,
+    mutation_strength = 1.,
+    l2norm_output = False
+):
+    mutations = torch.randn_like(latents)
+
+    mutated = latents + mutations * mutation_strength
+
+    if not l2norm_output:
+        return mutated
+
+    return l2norm(mutated)
 
 # simple MLP networks, but with latent variables
 # the latent variables are the "genes" with the rest of the network as the scaffold for "gene expression" - as suggested in the paper
