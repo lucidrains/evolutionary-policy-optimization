@@ -17,6 +17,9 @@ def default(v, d):
 def xnor(x, y):
     return not (x ^ y)
 
+def l2norm(t):
+    return F.normalize(t, p = 2, dim = -1)
+
 # crossover
 
 def crossover_weights(w1, w2):
@@ -40,7 +43,8 @@ def crossover_weights(w1, w2):
 def crossover_latents(
     parent1, parent2,
     weight = None,
-    random = False
+    random = False,
+    l2norm_output = False
 ):
     assert parent1.shape == parent2.shape
 
@@ -51,7 +55,11 @@ def crossover_latents(
         weight = default(weight, 0.5) # they do a simple averaging for the latents as crossover, but allow for random interpolation, as well extend this work for tournament selection, where same set of parents may be re-selected
 
     child = torch.lerp(parent1, parent2, weight)
-    return child
+
+    if not l2norm_output:
+        return child
+
+    return l2norm(child)
 
 # simple MLP networks, but with latent variables
 # the latent variables are the "genes" with the rest of the network as the scaffold for "gene expression" - as suggested in the paper
