@@ -156,7 +156,7 @@ class EPO(Module):
         crossover_random = True,       # random interp from parent1 to parent2 for crossover, set to `False` for averaging (0.5 constant value)
         l2norm_latent = False,         # whether to enforce latents on hypersphere,
         frac_tournaments = 0.25,       # fraction of genes to participate in tournament - the lower the value, the more chance a less fit gene could be selected
-        frac_natural_selection = 0.25, # number of least fit genes to remove from the pool
+        frac_natural_selected = 0.25,  # number of least fit genes to remove from the pool
         frac_elitism = 0.1,            # frac of population to preserve from being noised
         mutation_strength = 1.         # factor to multiply to gaussian noise as mutation to latents
     ):
@@ -175,14 +175,14 @@ class EPO(Module):
         # some derived values
 
         assert 0. < frac_tournaments < 1.
-        assert 0. < frac_natural_selection < 1.
+        assert 0. < frac_natural_selected < 1.
         assert 0. <= frac_elitism < 1.
-        assert (frac_natural_selection + frac_elitism) < 1.
+        assert (frac_natural_selected + frac_elitism) < 1.
 
         self.dim_latent = dim_latent
-        self.num_natural_selected_out = int(frac_natural_selection * num_latents)
+        self.num_natural_selected = int(frac_natural_selected * num_latents)
 
-        self.num_tournament_participants = int(frac_tournaments * num_latents)
+        self.num_tournament_participants = int(frac_tournaments * self.num_natural_selected)
         self.crossover_random  = crossover_random
 
         self.mutation_strength = mutation_strength
@@ -200,18 +200,19 @@ class EPO(Module):
 
         genes = self.latents # the latents are the genes
 
-        assert genes.shape[0] == fitness.shape[0]
+        pop_size = genes.shape[0]
+        assert pop_size == fitness.shape[0]
 
         # 1. natural selection is simple in silico
         # you sort the population by the fitness and slice off the least fit end
 
         fitness, sorted_indices = fitness.sort()
         sorted_genes = genes[sorted_indices]
-        genes = sorted_genes[self.num_natural_selected_out:]
+        genes = sorted_genes[-self.num_natural_selected:]
 
         # 2. for finding pairs of parents to replete gene pool, we will go with the popular tournament strategy
 
-        batch_randperm = torch.randn((self.num_natural_selected_out, self.num_tournament_participants)).argsort(dim = -1)
+        batch_randperm = torch.randn((pop_size - self.num_natural_selected, self.num_tournament_participants)).argsort(dim = -1)
 
         participants = genes[batch_randperm]
         participant_fitness = fitness[batch_randperm]
@@ -233,7 +234,7 @@ class EPO(Module):
 
         # 5. they use the elitism strategy to protect best performing genes from being changed
 
-        genes, elitists = genes[:-self.num_elites], genes[-self.num_elites:]
+        genes, elites = genes[:-self.num_elites], genes[-self.num_elites:]
 
         # 6. mutate with gaussian noise - todo: add drawing the mutation rate from exponential distribution, from the fast genetic algorithms paper from 2017
 
@@ -241,7 +242,7 @@ class EPO(Module):
 
         # 7. add back the elites
 
-        genes = cat((genes, elitists))
+        genes = cat((genes, elites))
 
         # store the genes for the next interaction with environment for new fitness values (a function of reward and other to be researched measures)
 
