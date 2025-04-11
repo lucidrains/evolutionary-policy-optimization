@@ -187,6 +187,7 @@ class EPO(Module):
 
         self.mutation_strength = mutation_strength
         self.num_elites = int(frac_elitism * num_latents)
+        self.has_elites = self.num_elites > 0
 
     @torch.no_grad() # non-gradient optimization, at least, not on the genetic level
     def genetic_algorithm_step(
@@ -234,15 +235,17 @@ class EPO(Module):
 
         # 5. they use the elitism strategy to protect best performing genes from being changed
 
-        genes, elites = genes[:-self.num_elites], genes[-self.num_elites:]
+        if self.has_elites:
+            genes, elites = genes[:-self.num_elites], genes[-self.num_elites:]
 
         # 6. mutate with gaussian noise - todo: add drawing the mutation rate from exponential distribution, from the fast genetic algorithms paper from 2017
 
         genes = mutation(genes, mutation_strength = self.mutation_strength)
 
-        # 7. add back the elites
+        # add back the elites
 
-        genes = cat((genes, elites))
+        if self.has_elites:
+            genes = cat((genes, elites))
 
         # store the genes for the next interaction with environment for new fitness values (a function of reward and other to be researched measures)
 
