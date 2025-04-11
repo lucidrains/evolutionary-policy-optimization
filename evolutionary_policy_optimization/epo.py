@@ -206,9 +206,9 @@ class EPO(Module):
         # 1. natural selection is simple in silico
         # you sort the population by the fitness and slice off the least fit end
 
-        fitness, sorted_indices = fitness.sort()
-        sorted_genes = genes[sorted_indices]
-        genes = sorted_genes[-self.num_natural_selected:]
+        sorted_indices = fitness.sort().indices
+        natural_selected_indices = sorted_indices[-self.num_natural_selected:]
+        genes, fitness = genes[natural_selected_indices], fitness[natural_selected_indices]
 
         # 2. for finding pairs of parents to replete gene pool, we will go with the popular tournament strategy
 
