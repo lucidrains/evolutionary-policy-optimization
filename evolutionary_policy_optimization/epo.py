@@ -229,16 +229,16 @@ class EPO(Module):
         parent1, parent2 = parents.unbind(dim = 1)
         children = crossover_latents(parent1, parent2, random = self.crossover_random)
 
-        # 4. append children to gene pool
+        # append children to gene pool
 
         genes = cat((children, genes))
 
-        # 5. they use the elitism strategy to protect best performing genes from being changed
+        # 4. they use the elitism strategy to protect best performing genes from being changed
 
         if self.has_elites:
             genes, elites = genes[:-self.num_elites], genes[-self.num_elites:]
 
-        # 6. mutate with gaussian noise - todo: add drawing the mutation rate from exponential distribution, from the fast genetic algorithms paper from 2017
+        # 5. mutate with gaussian noise - todo: add drawing the mutation rate from exponential distribution, from the fast genetic algorithms paper from 2017
 
         genes = mutation(genes, mutation_strength = self.mutation_strength)
 
