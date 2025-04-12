@@ -56,17 +56,17 @@ def actor_loss(
 ):
     log_probs = gather_log_prob(logits, actions)
 
-    entropy = calc_entropy(logits)
-
     ratio = (log_probs - old_log_probs).exp()
 
-    clipped_ratio = ratio.clamp(min = 1. - eps_clip, max = 1. + eps_clip)
-
     # classic clipped surrogate loss from ppo
+
+    clipped_ratio = ratio.clamp(min = 1. - eps_clip, max = 1. + eps_clip)
 
     actor_loss = -torch.min(clipped_ratio * advantage, ratio * advantage)
 
     # add entropy loss for exploration
+
+    entropy = calc_entropy(logits)
 
     entropy_aux_loss = -entropy_weight * entropy
 
