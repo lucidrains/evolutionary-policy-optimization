@@ -40,6 +40,12 @@ examples = [
     "tqdm",
 ]
 
+examples_gym = [
+    "box2d-py",
+    "gymnasium[box2d]>=1.0.0",
+    "tqdm",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
