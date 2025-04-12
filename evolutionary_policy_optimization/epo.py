@@ -207,6 +207,7 @@ class LatentGenePool(Module):
         if l2norm_latent:
             latents = maybe_l2norm(latents, dim = -1)
 
+        self.num_latents = num_latents
         self.latents = nn.Parameter(latents, requires_grad = False)
 
         self.maybe_l2norm = maybe_l2norm
@@ -248,6 +249,7 @@ class LatentGenePool(Module):
         p - population
         g - gene dimension
         """
+        assert self.num_latents > 1
 
         genes = self.latents # the latents are the genes
 
@@ -309,13 +311,20 @@ class LatentGenePool(Module):
     def forward(
         self,
         *args,
-        latent_id: int,
+        latent_id: int | None = None,
         **kwargs,
     ):
 
         assert exists(self.net)
 
+        # if only 1 latent, assume doing ablation and get lone gene
+
+        if self.num_latents == 1:
+            latent_id = 0
+
         assert 0 <= latent_id < self.num_latents
+
+        # fetch latent
 
         latent = self.latents[latent_id]
 
