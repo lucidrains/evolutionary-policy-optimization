@@ -161,13 +161,13 @@ class LatentGenePool(Module):
         self,
         num_latents,                     # same as gene pool size
         dim_latent,                      # gene dimension
-        net: MLP | Module | None = None,
         crossover_random = True,         # random interp from parent1 to parent2 for crossover, set to `False` for averaging (0.5 constant value)
         l2norm_latent = False,           # whether to enforce latents on hypersphere,
         frac_tournaments = 0.25,         # fraction of genes to participate in tournament - the lower the value, the more chance a less fit gene could be selected
         frac_natural_selected = 0.25,    # number of least fit genes to remove from the pool
         frac_elitism = 0.1,              # frac of population to preserve from being noised
-        mutation_strength = 1.           # factor to multiply to gaussian noise as mutation to latents
+        mutation_strength = 1.,          # factor to multiply to gaussian noise as mutation to latents
+        net: MLP | Module | dict | None = None,
     ):
         super().__init__()
 
@@ -201,6 +201,9 @@ class LatentGenePool(Module):
         self.has_elites = self.num_elites > 0
 
         # network for the latent / gene
+
+        if isinstance(net, dict):
+            net = MLP(**net)
 
         assert net.dim_latent == dim_latent, f'the latent dimension set on the MLP {net.dim_latent} must be what was passed into the latent gene pool module ({dim_latent})'
         self.net = net
