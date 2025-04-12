@@ -25,6 +25,52 @@ def xnor(x, y):
 def l2norm(t):
     return F.normalize(t, p = 2, dim = -1)
 
+# tensor helpers
+
+def log(t, eps = 1e-20):
+    return t.clamp(min = eps).log()
+
+def calc_entropy(logits):
+    prob = logits.softmax(dim = -1)
+    return -prob * log(prob)
+
+def gather_log_prob(
+    logits, # Float[b l]
+    indices # Int[b]
+): # Float[b]
+    indices = rearrange(indices, '... -> ... 1')
+    log_probs = logits.log_softmax(dim = -1)
+    log_prob = log_probs.gather(-1, indices)
+    return rearrange(log_prob, '... 1 -> ...')
+
+# reinforcement learning related - ppo
+
+def policy_loss(
+    logits,         # Float[b l]
+    old_log_probs,  # Float[b]
+    actions,        # Int[b]
+    advantages,     # Float[b]
+    eps_clip = 0.2,
+    entropy_weight = .01,
+):
+    log_probs = gather_log_prob(logits, actions)
+
+    entropy = calc_entropy(logits)
+
+    ratio = (log_probs - old_log_probs).exp()
+
+    clipped_ratio = ratio.clamp(min = 1. - eps_clip, max = 1. + eps_clip)
+
+    # classic clipped surrogate loss from ppo
+
+    actor_loss = -torch.min(clipped_ratio * advantage, ratio * advantage)
+
+    # add entropy loss for exploration
+
+    entropy_aux_loss = -entropy_weight * entropy
+
+    return actor_loss + entropy_aux_loss
+
 # evolution related functions
 
 def crossover_latents(
