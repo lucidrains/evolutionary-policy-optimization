@@ -36,7 +36,7 @@ action = latent_pool(state, latent_id = 3) # use latent / gene 4
 
 fitness = torch.randn(32)
 
-latent_pool.genetic_algorithm_step(fitness) # update once
+latent_pool.genetic_algorithm_step(fitness) # update latents using one generation of genetic algorithm
 
 ```
 
