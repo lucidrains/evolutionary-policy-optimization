@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn, cat
+import torch.nn.functional as F
 
 import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleList
@@ -45,7 +46,7 @@ def gather_log_prob(
 
 # reinforcement learning related - ppo
 
-def policy_loss(
+def actor_loss(
     logits,         # Float[b l]
     old_log_probs,  # Float[b]
     actions,        # Int[b]
@@ -70,6 +71,14 @@ def policy_loss(
     entropy_aux_loss = -entropy_weight * entropy
 
     return actor_loss + entropy_aux_loss
+
+def critic_loss(
+    pred_values,  # Float[b]
+    advantages,   # Float[b]
+    old_values    # Float[b]
+):
+    discounted_values = advantages + old_values
+    return F.mse_loss(pred_values, discounted_values)
 
 # evolution related functions
 
