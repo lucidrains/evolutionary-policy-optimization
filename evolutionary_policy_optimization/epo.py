@@ -205,10 +205,12 @@ class LatentGenePool(Module):
         assert net.dim_latent == dim_latent, f'the latent dimension set on the MLP {net.dim_latent} must be what was passed into the latent gene pool module ({dim_latent})'
         self.net = net
 
-    @torch.no_grad() # non-gradient optimization, at least, not on the genetic level
+    @torch.no_grad()
+    # non-gradient optimization, at least, not on the individual level (taken care of by rl component)
     def genetic_algorithm_step(
         self,
-        fitness # Float['p']
+        fitness, # Float['p'],
+        inplace = True
     ):
         """
         p - population
@@ -263,9 +265,14 @@ class LatentGenePool(Module):
         if self.has_elites:
             genes = cat((genes, elites))
 
+        genes = self.maybe_l2norm(genes)
+
+        if not inplace:
+            return genes
+
         # store the genes for the next interaction with environment for new fitness values (a function of reward and other to be researched measures)
 
-        self.latents.copy_(self.maybe_l2norm(genes))
+        self.latents.copy_(genes)
 
     def forward(
         self,
