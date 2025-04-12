@@ -156,19 +156,21 @@ class MLP(Module):
 
 # classes
 
-class EPO(Module):
+class LatentGenePool(Module):
     def __init__(
         self,
-        num_latents,                   # same as gene pool size
-        dim_latent,                    # gene dimension
-        crossover_random = True,       # random interp from parent1 to parent2 for crossover, set to `False` for averaging (0.5 constant value)
-        l2norm_latent = False,         # whether to enforce latents on hypersphere,
-        frac_tournaments = 0.25,       # fraction of genes to participate in tournament - the lower the value, the more chance a less fit gene could be selected
-        frac_natural_selected = 0.25,  # number of least fit genes to remove from the pool
-        frac_elitism = 0.1,            # frac of population to preserve from being noised
-        mutation_strength = 1.         # factor to multiply to gaussian noise as mutation to latents
+        num_latents,                     # same as gene pool size
+        dim_latent,                      # gene dimension
+        net: MLP | Module | None = None,
+        crossover_random = True,         # random interp from parent1 to parent2 for crossover, set to `False` for averaging (0.5 constant value)
+        l2norm_latent = False,           # whether to enforce latents on hypersphere,
+        frac_tournaments = 0.25,         # fraction of genes to participate in tournament - the lower the value, the more chance a less fit gene could be selected
+        frac_natural_selected = 0.25,    # number of least fit genes to remove from the pool
+        frac_elitism = 0.1,              # frac of population to preserve from being noised
+        mutation_strength = 1.           # factor to multiply to gaussian noise as mutation to latents
     ):
         super().__init__()
+
         maybe_l2norm = l2norm if l2norm_latent else identity
 
         latents = torch.randn(num_latents, dim_latent)
@@ -188,6 +190,7 @@ class EPO(Module):
         assert (frac_natural_selected + frac_elitism) < 1.
 
         self.dim_latent = dim_latent
+        self.num_latents = num_latents
         self.num_natural_selected = int(frac_natural_selected * num_latents)
 
         self.num_tournament_participants = int(frac_tournaments * self.num_natural_selected)
@@ -196,6 +199,11 @@ class EPO(Module):
         self.mutation_strength = mutation_strength
         self.num_elites = int(frac_elitism * num_latents)
         self.has_elites = self.num_elites > 0
+
+        # network for the latent / gene
+
+        assert net.dim_latent == dim_latent, f'the latent dimension set on the MLP {net.dim_latent} must be what was passed into the latent gene pool module ({dim_latent})'
+        self.net = net
 
     @torch.no_grad() # non-gradient optimization, at least, not on the genetic level
     def genetic_algorithm_step(
@@ -258,3 +266,22 @@ class EPO(Module):
         # store the genes for the next interaction with environment for new fitness values (a function of reward and other to be researched measures)
 
         self.latents.copy_(self.maybe_l2norm(genes))
+
+    def forward(
+        self,
+        *args,
+        latent_id: int,
+        **kwargs,
+    ):
+
+        assert exists(self.net)
+
+        assert 0 <= latent_id < self.num_latents
+
+        latent = self.latents[latent_id]
+
+        return self.net(
+            *args,
+            latent = latent,
+            **kwargs
+        )

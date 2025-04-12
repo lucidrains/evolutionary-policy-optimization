@@ -8,6 +8,30 @@ This paper stands out, as I have witnessed the positive effects first hand in an
 
 Besides their latent variable method, I'll also throw in some attempts with crossover in weight space
 
+## Usage
+
+```python
+import torch
+
+from evolutionary_policy_optimization import (
+    LatentGenePool,
+    MLP
+)
+
+latent_pool = LatentGenePool(
+    num_latents = 32,
+    dim_latent = 32,
+    net = MLP(
+        dims = (512, 256),
+        dim_latent = 32,
+    )
+)
+
+state = torch.randn(1, 512)
+action = latent_pool(state, latent_id = 3) # use latent / gene 4
+
+```
+
 ## Citations
 
 ```bibtex

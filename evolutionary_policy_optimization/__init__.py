@@ -1,1 +1,4 @@
-from evolutionary_policy_optimization.epo import EPO
+from evolutionary_policy_optimization.epo import (
+    MLP,
+    LatentGenePool
+)
