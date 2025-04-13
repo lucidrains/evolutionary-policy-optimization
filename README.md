@@ -6,7 +6,9 @@ Pytorch implementation of [Evolutionary Policy Optimization](https://web3.arxiv.
 
 This paper stands out, as I have witnessed the positive effects first hand in an [exploratory project](https://github.com/lucidrains/firefly-torch) (mixing evolution with gradient based methods). Perhaps the Alexnet moment for genetic algorithms has not come to pass yet.
 
-Besides their latent variable method, I'll also throw in some attempts with crossover in weight space
+Besides their latent variable strategy, I'll also throw in some attempts with crossover in weight space
+
+Update: I see, mixing genetic algorithms with gradient based method is already a research field, under [Memetic algorithms](https://en.wikipedia.org/wiki/Memetic_algorithm). There is nothing new under the sun
 
 ## Usage
 
