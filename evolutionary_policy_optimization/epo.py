@@ -368,3 +368,17 @@ class LatentGenePool(Module):
             latent = latent,
             **kwargs
         )
+
+# EPO - which is just PPO with natural selection of a population of latent variables conditioning the agent
+# the tricky part is that the latent ids for each episode / trajectory needs to be tracked
+
+class EPO(Module):
+    def __init__(
+        self
+    )
+        super().__init__()
+
+    def forward(
+        self
+    ):
+        raise NotImplementedError
