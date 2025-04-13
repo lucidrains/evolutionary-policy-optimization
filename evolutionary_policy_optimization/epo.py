@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import namedtuple
+
 import torch
 from torch import nn, cat
 import torch.nn.functional as F
@@ -218,6 +220,100 @@ class MLP(Module):
 
         return x
 
+# actor, critic, and agent (actor + critic)
+# eventually, should just create a separate repo and aggregate all the MLP related architectures
+
+class Actor(Module):
+    def __init__(
+        self,
+        dim_in,
+        num_actions,
+        dim_hiddens: tuple[int, ...],
+        dim_latent = 0,
+    ):
+        super().__init__()
+
+        assert len(dim_hiddens) >= 2
+        dim_first, *_, dim_last = dim_hiddens
+
+        self.init_layer = nn.Sequential(
+            nn.Linear(dim_in, dim_first),
+            nn.SiLU()
+        )
+
+        self.mlp = MLP(dims = dim_hiddens, dim_latent = dim_latent)
+
+        self.to_out = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim_last, num_actions),
+        )
+
+    def forward(
+        self,
+        state,
+        latent
+    ):
+
+        hidden = self.init_layer(state)
+
+        hidden = self.mlp(state, latent)
+
+        return self.to_out(hidden)
+
+class Critic(Module):
+    def __init__(
+        self,
+        dim_in,
+        dim_hiddens: tuple[int, ...],
+        dim_latent = 0,
+    ):
+        super().__init__()
+
+        assert len(dim_hiddens) >= 2
+        dim_first, *_, dim_last = dim_hiddens
+
+        self.init_layer = nn.Sequential(
+            nn.Linear(dim_in, dim_first),
+            nn.SiLU()
+        )
+
+        self.mlp = MLP(dims = dim_hiddens, dim_latent = dim_latent)
+
+        self.to_out = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim_last, 1),
+            Rearrange('... 1 -> ...')
+        )
+
+    def forward(
+        self,
+        state,
+        latent
+    ):
+
+        hidden = self.init_layer(state)
+
+        hidden = self.mlp(state, latent)
+
+        return self.to_out(hidden)
+
+class Agent(Module):
+    def __init__(
+        self,
+        actor: Actor,
+        critic: Critic,
+    ):
+        super().__init__()
+
+        self.actor = actor
+        self.critic = critic
+
+    def forward(
+        self,
+        memories: list[Memory]
+    ):
+        raise NotImplementedError
+
 # classes
 
 class LatentGenePool(Module):
@@ -372,13 +468,31 @@ class LatentGenePool(Module):
 # EPO - which is just PPO with natural selection of a population of latent variables conditioning the agent
 # the tricky part is that the latent ids for each episode / trajectory needs to be tracked
 
+Memory = namedtuple('Memory', [
+    'state',
+    'latent_gene_id',
+    'action',
+    'log_prob',
+    'reward',
+    'values',
+    'done'
+])
+
 class EPO(Module):
+
     def __init__(
-        self
-    )
+        self,
+        agent: Agent,
+        latent_gene_pool: LatentGenePool
+    ):
         super().__init__()
 
+        self.agent = agent
+        self.latent_gene_pool = latent_gene_pool
+
     def forward(
-        self
-    ):
+        self,
+        env
+    ) -> list[Memory]:
+
         raise NotImplementedError
