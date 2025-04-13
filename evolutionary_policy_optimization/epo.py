@@ -335,6 +335,25 @@ class Agent(Module):
     ):
         raise NotImplementedError
 
+# criteria for running genetic algorithm
+
+class ShouldRunGeneticAlgorithm(Module):
+    def __init__(
+        self,
+        gamma = 2. # not sure what the value is
+    ):
+        super().__init__()
+        self.gamma = gamma
+
+    def forward(self, fitnesses):
+        # equation (3)
+
+        # max(fitness) - min(fitness) > gamma * median(fitness)
+        # however, this equation does not make much sense to me if fitness increases unbounded
+        # just let it be customizable, and offer a variant where mean and variance is over some threshold (could account for skew too)
+
+        return (fitnesses.amax() - fitnesses.amin()) > (self.gamma * torch.median(fitnesses))
+
 # classes
 
 class LatentGenePool(Module):
@@ -350,6 +369,7 @@ class LatentGenePool(Module):
         frac_elitism = 0.1,              # frac of population to preserve from being noised
         mutation_strength = 1.,          # factor to multiply to gaussian noise as mutation to latents
         net: MLP | Module | dict | None = None,
+        should_run_genetic_algorithm: Module = ShouldRunGeneticAlgorithm() # eq (3) in paper
     ):
         super().__init__()
 
@@ -400,6 +420,8 @@ class LatentGenePool(Module):
 
         self.net = net
 
+        self.should_run_genetic_algorithm = should_run_genetic_algorithm
+
     @torch.no_grad()
     # non-gradient optimization, at least, not on the individual level (taken care of by rl component)
     def genetic_algorithm_step(
@@ -412,6 +434,10 @@ class LatentGenePool(Module):
         g - gene dimension
         n - number of genes per individual
         """
+
+        if not self.should_run_genetic_algorithm(fitness):
+            return
+
         assert self.num_latents > 1
 
         genes = self.latents # the latents are the genes
