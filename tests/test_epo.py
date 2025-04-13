@@ -1,18 +1,19 @@
+import pytest
+
 import torch
+from evolutionary_policy_optimization import LatentGenePool
 
-from evolutionary_policy_optimization import (
-    LatentGenePool,
-    MLP
-)
-
-def test_readme():
+@pytest.mark.parametrize('num_latent_sets', (1, 4))
+def test_readme(
+    num_latent_sets
+):
 
     latent_pool = LatentGenePool(
         num_latents = 32,
         dim_latent = 32,
-        net = MLP(
-            dims = (512, 256),
-            dim_latent = 32,
+        num_latent_sets = 4,
+        net = dict(
+            dims = (512, 256)
         )
     )
 

@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleList
 
-from einops import rearrange, repeat
+from einops import rearrange, repeat, einsum
 
 from assoc_scan import AssocScan
 
@@ -162,6 +162,7 @@ class MLP(Module):
         self,
         dims: tuple[int, ...],
         dim_latent = 0,
+        num_latent_sets = 1
     ):
         super().__init__()
         assert len(dims) >= 2, 'must have at least two dimensions'
@@ -169,16 +170,25 @@ class MLP(Module):
         # add the latent to the first dim
 
         first_dim, *rest_dims = dims
-        first_dim += dim_latent
-        dims = (first_dim, *rest_dims)
+        dims = (first_dim + dim_latent, *rest_dims)
+
+        assert num_latent_sets >= 1
 
         self.dim_latent = dim_latent
+        self.num_latent_sets = num_latent_sets
+
         self.needs_latent = dim_latent > 0
+        self.needs_latent_gate = num_latent_sets > 1
 
         self.encode_latent = nn.Sequential(
             Linear(dim_latent, dim_latent),
             nn.SiLU()
         ) if self.needs_latent else None
+
+        self.to_latent_gate = nn.Sequential(
+            Linear(first_dim, num_latent_sets),
+            nn.Softmax(dim = -1)
+        ) if self.needs_latent_gate else None
 
         # pairs of dimension
 
@@ -195,16 +205,27 @@ class MLP(Module):
         x,
         latent = None
     ):
+        batch = x.shape[0]
+
         assert xnor(self.needs_latent, exists(latent))
+
+        if exists(latent) and self.needs_latent_gate:
+            # an improvisation where set of genes with controlled expression by environment
+
+            gates = self.to_latent_gate(x)
+            latent = einsum(latent, gates, 'n g, b n -> b g')
+        else:
+            assert latent.shape[0] == 1
+            latent = latent[0]
 
         if exists(latent):
             # start with naive concatenative conditioning
             # but will also offer some alternatives once a spark is seen (film, adaptive linear from stylegan, etc)
 
-            batch = x.shape[0]
-
             latent = self.encode_latent(latent)
-            latent = repeat(latent, 'd -> b d', b = batch)
+
+            if latent.ndim == 1:
+                latent = repeat(latent, 'd -> b d', b = batch)
 
             x = cat((x, latent), dim = -1)
 
@@ -321,6 +342,7 @@ class LatentGenePool(Module):
         self,
         num_latents,                     # same as gene pool size
         dim_latent,                      # gene dimension
+        num_latent_sets = 1,             # allow for sets of latents / gene per individual, expression of a set controlled by the environment
         crossover_random = True,         # random interp from parent1 to parent2 for crossover, set to `False` for averaging (0.5 constant value)
         l2norm_latent = False,           # whether to enforce latents on hypersphere,
         frac_tournaments = 0.25,         # fraction of genes to participate in tournament - the lower the value, the more chance a less fit gene could be selected
@@ -333,12 +355,13 @@ class LatentGenePool(Module):
 
         maybe_l2norm = l2norm if l2norm_latent else identity
 
-        latents = torch.randn(num_latents, dim_latent)
+        latents = torch.randn(num_latents, num_latent_sets, dim_latent)
 
         if l2norm_latent:
             latents = maybe_l2norm(latents, dim = -1)
 
         self.num_latents = num_latents
+        self.num_latent_sets = num_latent_sets
         self.latents = nn.Parameter(latents, requires_grad = False)
 
         self.maybe_l2norm = maybe_l2norm
@@ -364,9 +387,17 @@ class LatentGenePool(Module):
         # network for the latent / gene
 
         if isinstance(net, dict):
+            assert 'dim_latent' not in net
+            assert 'num_latent_sets' not in net
+
+            net.update(dim_latent = dim_latent)
+            net.update(num_latent_sets = num_latent_sets)
+
             net = MLP(**net)
 
         assert net.dim_latent == dim_latent, f'the latent dimension set on the MLP {net.dim_latent} must be what was passed into the latent gene pool module ({dim_latent})'
+        assert net.num_latent_sets == num_latent_sets, 'number of latent sets must be equal between MLP and and latent gene pool container'
+
         self.net = net
 
     @torch.no_grad()
@@ -379,6 +410,7 @@ class LatentGenePool(Module):
         """
         p - population
         g - gene dimension
+        n - number of genes per individual
         """
         assert self.num_latents > 1
 
@@ -403,7 +435,7 @@ class LatentGenePool(Module):
 
         tournament_winner_indices = participant_fitness.topk(2, dim = -1).indices
 
-        tournament_winner_indices = repeat(tournament_winner_indices, '... -> ... g', g = self.dim_latent)
+        tournament_winner_indices = repeat(tournament_winner_indices, '... -> ... n g', g = self.dim_latent, n = self.num_latent_sets)
 
         parents = participants.gather(-2, tournament_winner_indices)
 
