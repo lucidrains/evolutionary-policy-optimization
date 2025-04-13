@@ -340,7 +340,7 @@ class Agent(Module):
 class ShouldRunGeneticAlgorithm(Module):
     def __init__(
         self,
-        gamma = 2. # not sure what the value is
+        gamma = 1.5 # not sure what the value is
     ):
         super().__init__()
         self.gamma = gamma
@@ -369,7 +369,8 @@ class LatentGenePool(Module):
         frac_elitism = 0.1,              # frac of population to preserve from being noised
         mutation_strength = 1.,          # factor to multiply to gaussian noise as mutation to latents
         net: MLP | Module | dict | None = None,
-        should_run_genetic_algorithm: Module = ShouldRunGeneticAlgorithm() # eq (3) in paper
+        should_run_genetic_algorithm: Module | None = None, # eq (3) in paper
+        default_should_run_ga_gamma = 1.5
     ):
         super().__init__()
 
@@ -419,6 +420,9 @@ class LatentGenePool(Module):
         assert net.num_latent_sets == num_latent_sets, 'number of latent sets must be equal between MLP and and latent gene pool container'
 
         self.net = net
+
+        if not exists(should_run_genetic_algorithm):
+            should_run_genetic_algorithm = ShouldRunGeneticAlgorithm(gamma = default_should_run_ga_gamma)
 
         self.should_run_genetic_algorithm = should_run_genetic_algorithm
 
