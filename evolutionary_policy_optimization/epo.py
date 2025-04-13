@@ -9,6 +9,8 @@ from torch.nn import Linear, Module, ModuleList
 
 from einops import rearrange, repeat
 
+from assoc_scan import AssocScan
+
 # helpers
 
 def exists(v):
@@ -79,6 +81,39 @@ def critic_loss(
 ):
     discounted_values = advantages + old_values
     return F.mse_loss(pred_values, discounted_values)
+
+# generalized advantage estimate
+
+def calc_generalized_advantage_estimate(
+    rewards, # Float[g n]
+    values,  # Float[g n+1]
+    masks,   # Bool[n]
+    gamma = 0.99,
+    lam = 0.95,
+    use_accelerated = None
+
+):
+    assert values.shape[-1] == (rewards.shape[-1] + 1)
+
+    use_accelerated = default(use_accelerated, rewards.is_cuda)
+    device = rewards.device
+
+    masks = repeat(masks, 'n -> g n', g = rewards.shape[0])
+
+    values, values_next = values[:, :-1], values[:, 1:]
+
+    delta = rewards + gamma * values_next * masks - values
+    gates = gamma * lam * masks
+
+    gates, delta = gates[..., :, None], delta[..., :, None]
+
+    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
+
+    gae = scan(gates, delta)
+
+    gae = gae[..., :, 0]
+
+    return gae
 
 # evolution related functions
 
