@@ -1,0 +1,15 @@
+name: Tests the examples in README
+on: push
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Python
+        uses: actions/setup-python@v4
+      - name: Install dependencies
+        run: |
+          pip install .[test]
+      - name: Run pytest
+        run: pytest tests
