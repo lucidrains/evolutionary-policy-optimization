@@ -43,6 +43,7 @@ value = critic(state, latent)
 
 fitness = torch.randn(128)
 
+latent_pool.genetic_algorithm_step(fitness) # update latent genes with genetic algorithm
 ```
 
 ## Citations
