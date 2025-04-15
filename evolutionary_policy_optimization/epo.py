@@ -502,6 +502,38 @@ class LatentGenePool(Module):
 
 # agent contains the actor, critic, and the latent genetic pool
 
+def create_agent(
+    dim_state,
+    num_latents,
+    dim_latent,
+    actor_num_actions,
+    actor_dim_hiddens: int | tuple[int, ...],
+    critic_dim_hiddens: int | tuple[int, ...],
+    num_latent_sets = 1
+) -> Agent:
+
+    actor = Actor(
+        num_actions = actor_num_actions,
+        dim_state = dim_state,
+        dim_latent = dim_latent,
+        dim_hiddens = actor_dim_hiddens
+    )
+
+    critic = Critic(
+        dim_state = dim_state,
+        dim_latent = dim_latent,
+        dim_hiddens = critic_dim_hiddens
+    )
+
+    latent_gene_pool = LatentGenePool(
+        dim_state = dim_state,
+        num_latents = num_latents,
+        dim_latent = dim_latent,
+        num_latent_sets = num_latent_sets
+    )
+
+    return Agent(actor = actor, critic = critic, latent_gene_pool = latent_gene_pool)
+
 class Agent(Module):
     def __init__(
         self,
@@ -515,6 +547,28 @@ class Agent(Module):
         self.critic = critic
 
         self.latent_gene_pool = latent_gene_pool
+
+    def get_actor_actions(
+        self,
+        state,
+        latent_id
+    ):
+        latent = self.latent_gene_pool(latent_id = latent_id, state = state)
+        return self.actor(state, latent)
+
+    def get_critic_values(
+        self,
+        state,
+        latent_id
+    ):
+        latent = self.latent_gene_pool(latent_id = latent_id, state = state)
+        return self.critic(state, latent)
+
+    def update_latent_gene_pool_(
+        self,
+        fitnesses
+    ):
+        return self.latent_gene_pool.genetic_algorithm_step(fitnesses)
 
     def forward(
         self,
