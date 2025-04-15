@@ -1,6 +1,6 @@
 [project]
 name = "evolutionary-policy-optimization"
-version = "0.0.15"
+version = "0.0.16"
 description = "EPO - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -24,6 +24,7 @@ classifiers=[
   ]
 
 dependencies = [
+    "adam-atan2-pytorch",
     'assoc-scan',
     'einops>=0.8.0',
     'torch>=2.2',
