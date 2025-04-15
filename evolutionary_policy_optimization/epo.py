@@ -15,6 +15,8 @@ from assoc_scan import AssocScan
 
 from adam_atan2_pytorch import AdoptAtan2
 
+from hl_gauss_pytorch import HLGaussLayer
+
 # helpers
 
 def exists(v):
