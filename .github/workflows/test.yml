@@ -8,8 +8,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Python
         uses: actions/setup-python@v4
+      - name: Install uv
+        run: pip install uv && uv venv
       - name: Install dependencies
         run: |
-          pip install .[test]
+          uv pip install .[test]
       - name: Run pytest
-        run: pytest tests
+        run: uv run pytest tests
