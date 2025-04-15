@@ -206,6 +206,8 @@ class Actor(Module):
         assert len(dim_hiddens) >= 2
         dim_first, *_, dim_last = dim_hiddens
 
+        self.dim_latent = dim_latent
+
         self.init_layer = nn.Sequential(
             nn.Linear(dim_state, dim_first),
             nn.SiLU()
@@ -241,6 +243,8 @@ class Critic(Module):
 
         assert len(dim_hiddens) >= 2
         dim_first, *_, dim_last = dim_hiddens
+
+        self.dim_latent = dim_latent
 
         self.init_layer = nn.Sequential(
             nn.Linear(dim_state, dim_first),
@@ -489,6 +493,8 @@ class Agent(Module):
         self.critic = critic
 
         self.latent_gene_pool = latent_gene_pool
+
+        assert actor.dim_latent == critic.dim_latent == latent_gene_pool.dim_latent
 
         # optimizers
 
