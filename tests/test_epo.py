@@ -7,7 +7,7 @@ from evolutionary_policy_optimization import (
     Critic
 )
 
-@pytest.mark.parametrize('num_latent_sets', (1,))
+@pytest.mark.parametrize('num_latent_sets', (1, 4))
 def test_readme(
     num_latent_sets
 ):
@@ -15,15 +15,16 @@ def test_readme(
     latent_pool = LatentGenePool(
         num_latents = 128,
         dim_latent = 32,
-        num_latent_sets = 1
+        dim_state = 512,
+        num_latent_sets = num_latent_sets
     )
 
     state = torch.randn(1, 512)
 
-    actor = Actor(512, dim_hiddens = (256, 128), num_actions = 4, dim_latent = 32)
-    critic = Critic(512, dim_hiddens = (256, 128, 64), dim_latent = 32)
+    actor = Actor(dim_state = 512, dim_hiddens = (256, 128), num_actions = 4, dim_latent = 32)
+    critic = Critic(dim_state = 512, dim_hiddens = (256, 128, 64), dim_latent = 32)
 
-    latent = latent_pool(latent_id = 2)
+    latent = latent_pool(latent_id = 2, state = state)
 
     actions = actor(state, latent)
     value = critic(state, latent)

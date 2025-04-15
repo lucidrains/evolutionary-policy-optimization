@@ -163,7 +163,6 @@ class MLP(Module):
         self,
         dims: tuple[int, ...],
         dim_latent = 0,
-        num_latent_sets = 1
     ):
         super().__init__()
         assert len(dims) >= 2, 'must have at least two dimensions'
@@ -173,23 +172,14 @@ class MLP(Module):
         first_dim, *rest_dims = dims
         dims = (first_dim + dim_latent, *rest_dims)
 
-        assert num_latent_sets >= 1
-
         self.dim_latent = dim_latent
-        self.num_latent_sets = num_latent_sets
 
         self.needs_latent = dim_latent > 0
-        self.needs_latent_gate = num_latent_sets > 1
 
         self.encode_latent = nn.Sequential(
             Linear(dim_latent, dim_latent),
             nn.SiLU()
         ) if self.needs_latent else None
-
-        self.to_latent_gate = nn.Sequential(
-            Linear(first_dim, num_latent_sets),
-            nn.Softmax(dim = -1)
-        ) if self.needs_latent_gate else None
 
         # pairs of dimension
 
@@ -209,15 +199,6 @@ class MLP(Module):
         batch = x.shape[0]
 
         assert xnor(self.needs_latent, exists(latent))
-
-        if exists(latent) and self.needs_latent_gate:
-            # an improvisation where set of genes with controlled expression by environment
-
-            gates = self.to_latent_gate(x)
-            latent = einsum(latent, gates, 'n g, b n -> b g')
-        else:
-            assert latent.shape[0] == 1
-            latent = latent[0]
 
         if exists(latent):
             # start with naive concatenative conditioning
@@ -248,7 +229,7 @@ class MLP(Module):
 class Actor(Module):
     def __init__(
         self,
-        dim_in,
+        dim_state,
         num_actions,
         dim_hiddens: tuple[int, ...],
         dim_latent = 0,
@@ -259,7 +240,7 @@ class Actor(Module):
         dim_first, *_, dim_last = dim_hiddens
 
         self.init_layer = nn.Sequential(
-            nn.Linear(dim_in, dim_first),
+            nn.Linear(dim_state, dim_first),
             nn.SiLU()
         )
 
@@ -285,7 +266,7 @@ class Actor(Module):
 class Critic(Module):
     def __init__(
         self,
-        dim_in,
+        dim_state,
         dim_hiddens: tuple[int, ...],
         dim_latent = 0,
     ):
@@ -295,7 +276,7 @@ class Critic(Module):
         dim_first, *_, dim_last = dim_hiddens
 
         self.init_layer = nn.Sequential(
-            nn.Linear(dim_in, dim_first),
+            nn.Linear(dim_state, dim_first),
             nn.SiLU()
         )
 
@@ -346,6 +327,7 @@ class LatentGenePool(Module):
         num_latents,                     # same as gene pool size
         dim_latent,                      # gene dimension
         num_latent_sets = 1,             # allow for sets of latents / gene per individual, expression of a set controlled by the environment
+        dim_state = None,
         crossover_random = True,         # random interp from parent1 to parent2 for crossover, set to `False` for averaging (0.5 constant value)
         l2norm_latent = False,           # whether to enforce latents on hypersphere,
         frac_tournaments = 0.25,         # fraction of genes to participate in tournament - the lower the value, the more chance a less fit gene could be selected
@@ -365,10 +347,22 @@ class LatentGenePool(Module):
             latents = maybe_l2norm(latents, dim = -1)
 
         self.num_latents = num_latents
-        self.num_latent_sets = num_latent_sets
+        self.needs_latent_gate = num_latent_sets > 1
         self.latents = nn.Parameter(latents, requires_grad = False)
 
         self.maybe_l2norm = maybe_l2norm
+
+        # gene expression as a function of environment
+
+        self.num_latent_sets = num_latent_sets
+
+        if self.needs_latent_gate:
+            assert exists(dim_state), '`dim_state` must be passed in if using gated gene expression'
+
+        self.to_latent_gate = nn.Sequential(
+            Linear(dim_state, num_latent_sets),
+            nn.Softmax(dim = -1)
+        ) if self.needs_latent_gate else None
 
         # some derived values
 
@@ -471,6 +465,7 @@ class LatentGenePool(Module):
     def forward(
         self,
         *args,
+        state: Tensor | None = None,
         latent_id: int | None = None,
         net: Module | None = None,
         **kwargs,
@@ -486,6 +481,15 @@ class LatentGenePool(Module):
         # fetch latent
 
         latent = self.latents[latent_id]
+
+        if self.needs_latent_gate:
+            assert exists(state), 'state must be passed in if greater than number of 1 latent set'
+
+            gates = self.to_latent_gate(state)
+            latent = einsum(latent, gates, 'n g, b n -> b g')
+        else:
+            assert latent.shape[0] == 1
+            latent = latent[0]
 
         if not exists(net):
             return latent
