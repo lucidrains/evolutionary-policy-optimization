@@ -593,13 +593,10 @@ class EPO(Module):
 
     def __init__(
         self,
-        agent: Agent,
-        latent_gene_pool: LatentGenePool
+        agent: Agent
     ):
         super().__init__()
-
         self.agent = agent
-        self.latent_gene_pool = latent_gene_pool
 
     def forward(
         self,
