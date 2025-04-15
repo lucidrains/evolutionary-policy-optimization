@@ -5,14 +5,15 @@ from collections import namedtuple
 import torch
 from torch import nn, cat
 import torch.nn.functional as F
-
-import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleList
+from torch.utils.data import TensorDataset, DataLoader
 
 from einops import rearrange, repeat, einsum
 from einops.layers.torch import Rearrange
 
 from assoc_scan import AssocScan
+
+from adam_atan2_pytorch import AdoptAtan2
 
 # helpers
 
@@ -48,42 +49,6 @@ def gather_log_prob(
     log_probs = logits.log_softmax(dim = -1)
     log_prob = log_probs.gather(-1, indices)
     return rearrange(log_prob, '... 1 -> ...')
-
-# reinforcement learning related - ppo
-
-def actor_loss(
-    logits,         # Float[b l]
-    old_log_probs,  # Float[b]
-    actions,        # Int[b]
-    advantages,     # Float[b]
-    eps_clip = 0.2,
-    entropy_weight = .01,
-):
-    log_probs = gather_log_prob(logits, actions)
-
-    ratio = (log_probs - old_log_probs).exp()
-
-    # classic clipped surrogate loss from ppo
-
-    clipped_ratio = ratio.clamp(min = 1. - eps_clip, max = 1. + eps_clip)
-
-    actor_loss = -torch.min(clipped_ratio * advantage, ratio * advantage)
-
-    # add entropy loss for exploration
-
-    entropy = calc_entropy(logits)
-
-    entropy_aux_loss = -entropy_weight * entropy
-
-    return actor_loss + entropy_aux_loss
-
-def critic_loss(
-    pred_values,  # Float[b]
-    advantages,   # Float[b]
-    old_values    # Float[b]
-):
-    discounted_values = advantages + old_values
-    return F.mse_loss(pred_values, discounted_values)
 
 # generalized advantage estimate
 
@@ -500,6 +465,100 @@ class LatentGenePool(Module):
             **kwargs
         )
 
+# agent class
+
+class Agent(Module):
+    def __init__(
+        self,
+        actor: Actor,
+        critic: Critic,
+        latent_gene_pool: LatentGenePool,
+        optim_klass = AdoptAtan2,
+        actor_lr = 1e-4,
+        critic_lr = 1e-4,
+        latent_lr = 1e-5,
+        actor_optim_kwargs: dict = dict(),
+        critic_optim_kwargs: dict = dict(),
+        latent_optim_kwargs: dict = dict(),
+    ):
+        super().__init__()
+
+        self.actor = actor
+        self.critic = critic
+
+        self.latent_gene_pool = latent_gene_pool
+
+        # optimizers
+
+        self.actor_optim = optim_klass(actor.parameters(), lr = actor_lr, **actor_optim_kwargs)
+        self.critic_optim = optim_klass(critic.parameters(), lr = critic_lr, **critic_optim_kwargs)
+
+        self.latent_optim = optim_klass(latent_gene_pool.parameters(), lr = latent_lr, **latent_optim_kwargs) if latent_gene_pool.needs_latent_gate else None
+
+    def get_actor_actions(
+        self,
+        state,
+        latent_id
+    ):
+        latent = self.latent_gene_pool(latent_id = latent_id, state = state)
+        return self.actor(state, latent)
+
+    def get_critic_values(
+        self,
+        state,
+        latent_id
+    ):
+        latent = self.latent_gene_pool(latent_id = latent_id, state = state)
+        return self.critic(state, latent)
+
+    def update_latent_gene_pool_(
+        self,
+        fitnesses
+    ):
+        return self.latent_gene_pool.genetic_algorithm_step(fitnesses)
+
+    def forward(
+        self,
+        memories: list[Memory]
+    ):
+        raise NotImplementedError
+
+# reinforcement learning related - ppo
+
+def actor_loss(
+    logits,         # Float[b l]
+    old_log_probs,  # Float[b]
+    actions,        # Int[b]
+    advantages,     # Float[b]
+    eps_clip = 0.2,
+    entropy_weight = .01,
+):
+    log_probs = gather_log_prob(logits, actions)
+
+    ratio = (log_probs - old_log_probs).exp()
+
+    # classic clipped surrogate loss from ppo
+
+    clipped_ratio = ratio.clamp(min = 1. - eps_clip, max = 1. + eps_clip)
+
+    actor_loss = -torch.min(clipped_ratio * advantage, ratio * advantage)
+
+    # add entropy loss for exploration
+
+    entropy = calc_entropy(logits)
+
+    entropy_aux_loss = -entropy_weight * entropy
+
+    return actor_loss + entropy_aux_loss
+
+def critic_loss(
+    pred_values,  # Float[b]
+    advantages,   # Float[b]
+    old_values    # Float[b]
+):
+    discounted_values = advantages + old_values
+    return F.mse_loss(pred_values, discounted_values)
+
 # agent contains the actor, critic, and the latent genetic pool
 
 def create_agent(
@@ -533,48 +592,6 @@ def create_agent(
     )
 
     return Agent(actor = actor, critic = critic, latent_gene_pool = latent_gene_pool)
-
-class Agent(Module):
-    def __init__(
-        self,
-        actor: Actor,
-        critic: Critic,
-        latent_gene_pool: LatentGenePool
-    ):
-        super().__init__()
-
-        self.actor = actor
-        self.critic = critic
-
-        self.latent_gene_pool = latent_gene_pool
-
-    def get_actor_actions(
-        self,
-        state,
-        latent_id
-    ):
-        latent = self.latent_gene_pool(latent_id = latent_id, state = state)
-        return self.actor(state, latent)
-
-    def get_critic_values(
-        self,
-        state,
-        latent_id
-    ):
-        latent = self.latent_gene_pool(latent_id = latent_id, state = state)
-        return self.critic(state, latent)
-
-    def update_latent_gene_pool_(
-        self,
-        fitnesses
-    ):
-        return self.latent_gene_pool.genetic_algorithm_step(fitnesses)
-
-    def forward(
-        self,
-        memories: list[Memory]
-    ):
-        raise NotImplementedError
 
 # EPO - which is just PPO with natural selection of a population of latent variables conditioning the agent
 # the tricky part is that the latent ids for each episode / trajectory needs to be tracked
