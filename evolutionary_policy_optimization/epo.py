@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleList
 
 from einops import rearrange, repeat, einsum
+from einops.layers.torch import Rearrange
 
 from assoc_scan import AssocScan
 
@@ -277,7 +278,7 @@ class Actor(Module):
 
         hidden = self.init_layer(state)
 
-        hidden = self.mlp(state, latent)
+        hidden = self.mlp(hidden, latent)
 
         return self.to_out(hidden)
 
@@ -314,26 +315,9 @@ class Critic(Module):
 
         hidden = self.init_layer(state)
 
-        hidden = self.mlp(state, latent)
+        hidden = self.mlp(hidden, latent)
 
         return self.to_out(hidden)
-
-class Agent(Module):
-    def __init__(
-        self,
-        actor: Actor,
-        critic: Critic,
-    ):
-        super().__init__()
-
-        self.actor = actor
-        self.critic = critic
-
-    def forward(
-        self,
-        memories: list[Memory]
-    ):
-        raise NotImplementedError
 
 # criteria for running genetic algorithm
 
@@ -368,7 +352,6 @@ class LatentGenePool(Module):
         frac_natural_selected = 0.25,    # number of least fit genes to remove from the pool
         frac_elitism = 0.1,              # frac of population to preserve from being noised
         mutation_strength = 1.,          # factor to multiply to gaussian noise as mutation to latents
-        net: MLP | Module | dict | None = None,
         should_run_genetic_algorithm: Module | None = None, # eq (3) in paper
         default_should_run_ga_gamma = 1.5
     ):
@@ -404,22 +387,6 @@ class LatentGenePool(Module):
         self.mutation_strength = mutation_strength
         self.num_elites = int(frac_elitism * num_latents)
         self.has_elites = self.num_elites > 0
-
-        # network for the latent / gene
-
-        if isinstance(net, dict):
-            assert 'dim_latent' not in net
-            assert 'num_latent_sets' not in net
-
-            net.update(dim_latent = dim_latent)
-            net.update(num_latent_sets = num_latent_sets)
-
-            net = MLP(**net)
-
-        assert net.dim_latent == dim_latent, f'the latent dimension set on the MLP {net.dim_latent} must be what was passed into the latent gene pool module ({dim_latent})'
-        assert net.num_latent_sets == num_latent_sets, 'number of latent sets must be equal between MLP and and latent gene pool container'
-
-        self.net = net
 
         if not exists(should_run_genetic_algorithm):
             should_run_genetic_algorithm = ShouldRunGeneticAlgorithm(gamma = default_should_run_ga_gamma)
@@ -467,7 +434,7 @@ class LatentGenePool(Module):
 
         tournament_winner_indices = repeat(tournament_winner_indices, '... -> ... n g', g = self.dim_latent, n = self.num_latent_sets)
 
-        parents = participants.gather(-2, tournament_winner_indices)
+        parents = participants.gather(-3, tournament_winner_indices)
 
         # 3. do a crossover of the parents - in their case they went for a simple averaging, but since we are doing tournament style and the same pair of parents may be re-selected, lets make it random interpolation
 
@@ -505,10 +472,9 @@ class LatentGenePool(Module):
         self,
         *args,
         latent_id: int | None = None,
+        net: Module | None = None,
         **kwargs,
     ):
-
-        assert exists(self.net)
 
         # if only 1 latent, assume doing ablation and get lone gene
 
@@ -521,11 +487,36 @@ class LatentGenePool(Module):
 
         latent = self.latents[latent_id]
 
-        return self.net(
+        if not exists(net):
+            return latent
+
+        return net(
             *args,
             latent = latent,
             **kwargs
         )
+
+# agent contains the actor, critic, and the latent genetic pool
+
+class Agent(Module):
+    def __init__(
+        self,
+        actor: Actor,
+        critic: Critic,
+        latent_gene_pool: LatentGenePool
+    ):
+        super().__init__()
+
+        self.actor = actor
+        self.critic = critic
+
+        self.latent_gene_pool = latent_gene_pool
+
+    def forward(
+        self,
+        memories: list[Memory]
+    ):
+        raise NotImplementedError
 
 # EPO - which is just PPO with natural selection of a population of latent variables conditioning the agent
 # the tricky part is that the latent ids for each episode / trajectory needs to be tracked

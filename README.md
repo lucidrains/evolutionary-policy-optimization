@@ -8,37 +8,40 @@ This paper stands out, as I have witnessed the positive effects first hand in an
 
 Besides their latent variable strategy, I'll also throw in some attempts with crossover in weight space
 
-Update: I see, mixing genetic algorithms with gradient based method is already a research field, under [Memetic algorithms](https://en.wikipedia.org/wiki/Memetic_algorithm). This is also incidentally what I have concluded what Science is. I am in direct exposure to this phenomenon on a daily basis
+Update: I see, mixing genetic algorithms with gradient based method is already a research field, under [Memetic algorithms](https://en.wikipedia.org/wiki/Memetic_algorithm)
 
 ## Usage
 
 ```python
+
 import torch
 
 from evolutionary_policy_optimization import (
     LatentGenePool,
-    MLP
+    Actor,
+    Critic
 )
 
 latent_pool = LatentGenePool(
-    num_latents = 32,
+    num_latents = 128,
     dim_latent = 32,
-    net = MLP(
-        dims = (512, 256),
-        dim_latent = 32,
-    )
 )
 
 state = torch.randn(1, 512)
-action = latent_pool(state, latent_id = 3) # use latent / gene 4
+
+actor = Actor(512, dim_hiddens = (256, 128), num_actions = 4, dim_latent = 32)
+critic = Critic(512, dim_hiddens = (256, 128, 64), dim_latent = 32)
+
+latent = latent_pool(latent_id = 2)
+
+actions = actor(state, latent)
+value = critic(state, latent)
 
 # interact with environment and receive rewards, termination etc
 
 # derive a fitness score for each gene / latent
 
-fitness = torch.randn(32)
-
-latent_pool.genetic_algorithm_step(fitness) # update latents using one generation of genetic algorithm
+fitness = torch.randn(128)
 
 ```
 
