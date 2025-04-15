@@ -10,6 +10,12 @@ Besides their latent variable strategy, I'll also throw in some attempts with cr
 
 Update: I see, mixing genetic algorithms with gradient based method is already a research field, under [Memetic algorithms](https://en.wikipedia.org/wiki/Memetic_algorithm)
 
+## Install
+
+```bash
+$ pip install evolutionary-policy-optimization
+```
+
 ## Usage
 
 ```python
