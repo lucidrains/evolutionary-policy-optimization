@@ -1,0 +1,3 @@
+box2d-py
+gymnasium[box2d]>=1.0.0
+tqdm
