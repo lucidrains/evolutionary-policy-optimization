@@ -31,10 +31,13 @@ def identity(t):
 def xnor(x, y):
     return not (x ^ y)
 
-def l2norm(t):
-    return F.normalize(t, p = 2, dim = -1)
+def divisible_by(num, den):
+    return (num % den) == 0
 
 # tensor helpers
+
+def l2norm(t):
+    return F.normalize(t, p = 2, dim = -1)
 
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
@@ -300,6 +303,7 @@ class LatentGenePool(Module):
         num_latents,                     # same as gene pool size
         dim_latent,                      # gene dimension
         num_latent_sets = 1,             # allow for sets of latents / gene per individual, expression of a set controlled by the environment
+        num_islands = 1,                 # add the island strategy, which has been effectively used in a few recent works
         dim_state = None,
         frozen_latents = True,
         crossover_random = True,         # random interp from parent1 to parent2 for crossover, set to `False` for averaging (0.5 constant value)
@@ -340,6 +344,9 @@ class LatentGenePool(Module):
 
         # some derived values
 
+        assert num_islands >= 1
+        assert divisible_by(num_latents, num_islands)
+
         assert 0. < frac_tournaments < 1.
         assert 0. < frac_natural_selected < 1.
         assert 0. <= frac_elitism < 1.
@@ -347,13 +354,16 @@ class LatentGenePool(Module):
 
         self.dim_latent = dim_latent
         self.num_latents = num_latents
-        self.num_natural_selected = int(frac_natural_selected * num_latents)
+        self.num_islands = num_islands
+
+        latents_per_island = num_latents // num_islands
+        self.num_natural_selected = int(frac_natural_selected * latents_per_island)
 
         self.num_tournament_participants = int(frac_tournaments * self.num_natural_selected)
         self.crossover_random  = crossover_random
 
         self.mutation_strength = mutation_strength
-        self.num_elites = int(frac_elitism * num_latents)
+        self.num_elites = int(frac_elitism * latents_per_island)
         self.has_elites = self.num_elites > 0
 
         if not exists(should_run_genetic_algorithm):
@@ -369,10 +379,15 @@ class LatentGenePool(Module):
         inplace = True
     ):
         """
+        i - islands
         p - population
         g - gene dimension
         n - number of genes per individual
+        t - num tournament participants
         """
+
+        islands = self.num_islands
+        tournament_participants = self.num_tournament_participants
 
         if not self.should_run_genetic_algorithm(fitness):
             return
@@ -384,39 +399,51 @@ class LatentGenePool(Module):
         pop_size = genes.shape[0]
         assert pop_size == fitness.shape[0]
 
+        # split out the islands
+
+        genes = rearrange(genes, '(i p) n g -> i p n g', i = islands)
+        fitness = rearrange(fitness, '(i p) -> i p', i = islands)
+
+        pop_size_per_island = pop_size // islands
+
         # 1. natural selection is simple in silico
         # you sort the population by the fitness and slice off the least fit end
 
-        sorted_indices = fitness.sort().indices
-        natural_selected_indices = sorted_indices[-self.num_natural_selected:]
-        genes, fitness = genes[natural_selected_indices], fitness[natural_selected_indices]
+        sorted_indices = fitness.sort(dim = -1).indices
+        natural_selected_indices = sorted_indices[..., -self.num_natural_selected:]
+        natural_select_gene_indices = repeat(natural_selected_indices, '... -> ... n g', n = genes.shape[-2], g = genes.shape[-1])
+
+        genes, fitness = genes.gather(1, natural_select_gene_indices), fitness.gather(1, natural_selected_indices)
 
         # 2. for finding pairs of parents to replete gene pool, we will go with the popular tournament strategy
 
-        batch_randperm = torch.randn((pop_size - self.num_natural_selected, self.num_tournament_participants)).argsort(dim = -1)
+        rand_tournament_gene_ids = torch.randn((islands, pop_size_per_island - self.num_natural_selected, tournament_participants)).argsort(dim = -1)
+        rand_tournament_gene_ids_for_gather = rearrange(rand_tournament_gene_ids, 'i p t -> i (p t)')
 
-        participants = genes[batch_randperm]
-        participant_fitness = fitness[batch_randperm]
+        participant_fitness = fitness.gather(1, rand_tournament_gene_ids_for_gather)
+        participant_fitness = rearrange(participant_fitness, 'i (p t) -> i p t', t = tournament_participants)
 
-        tournament_winner_indices = participant_fitness.topk(2, dim = -1).indices
+        parent_indices_at_tournament = participant_fitness.topk(2, dim = -1).indices
+        parent_gene_ids = rand_tournament_gene_ids.gather(-1, parent_indices_at_tournament)
 
-        tournament_winner_indices = repeat(tournament_winner_indices, '... -> ... n g', g = self.dim_latent, n = self.num_latent_sets)
+        parent_gene_ids_for_gather = repeat(parent_gene_ids, 'i p parents -> i (p parents) n g', n = genes.shape[-2], g = genes.shape[-1])
 
-        parents = participants.gather(-3, tournament_winner_indices)
+        parents = genes.gather(1, parent_gene_ids_for_gather)
+        parents = rearrange(parents, 'i (p parents) ... -> i p parents ...', parents = 2)
 
         # 3. do a crossover of the parents - in their case they went for a simple averaging, but since we are doing tournament style and the same pair of parents may be re-selected, lets make it random interpolation
 
-        parent1, parent2 = parents.unbind(dim = 1)
+        parent1, parent2 = parents.unbind(dim = 2)
         children = crossover_latents(parent1, parent2, random = self.crossover_random)
 
         # append children to gene pool
 
-        genes = cat((children, genes))
+        genes = cat((children, genes), dim = 1)
 
         # 4. they use the elitism strategy to protect best performing genes from being changed
 
         if self.has_elites:
-            genes, elites = genes[:-self.num_elites], genes[-self.num_elites:]
+            genes, elites = genes[:, :-self.num_elites], genes[:, -self.num_elites:]
 
         # 5. mutate with gaussian noise - todo: add drawing the mutation rate from exponential distribution, from the fast genetic algorithms paper from 2017
 
@@ -425,9 +452,13 @@ class LatentGenePool(Module):
         # add back the elites
 
         if self.has_elites:
-            genes = cat((genes, elites))
+            genes = cat((genes, elites), dim = 1)
 
         genes = self.maybe_l2norm(genes)
+
+        # merge island back into pop dimension
+
+        genes = rearrange(genes, 'i p ... -> (i p) ...')
 
         if not inplace:
             return genes
