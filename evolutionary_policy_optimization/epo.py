@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import namedtuple
 
 import torch
-from torch import nn, cat
+from torch import nn, cat, is_tensor, tensor
 import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleList
 from torch.utils.data import TensorDataset, DataLoader
@@ -175,6 +175,8 @@ class MLP(Module):
 
             if latent.ndim == 1:
                 latent = repeat(latent, 'd -> b d', b = batch)
+
+            assert latent.shape[0] == x.shape[0], f'received state with batch size {x.shape[0]} but latent ids received had batch size {latent_id.shape[0]}'
 
             x = cat((x, latent), dim = -1)
 
@@ -441,25 +443,38 @@ class LatentGenePool(Module):
         net: Module | None = None,
         **kwargs,
     ):
+        device = self.latents.device
 
         # if only 1 latent, assume doing ablation and get lone gene
 
         if not exists(latent_id) and self.num_latents == 1:
             latent_id = 0
 
-        assert 0 <= latent_id < self.num_latents
+        if not is_tensor(latent_id):
+            latent_id = tensor(latent_id, device = device)
+
+        assert (0 <= latent_id).all() and (latent_id < self.num_latents).all()
 
         # fetch latent
+
+        fetching_multiple_latents = latent_id.numel() > 1
 
         latent = self.latents[latent_id]
 
         if self.needs_latent_gate:
             assert exists(state), 'state must be passed in if greater than number of 1 latent set'
 
+            if not fetching_multiple_latents:
+                latent = repeat(latent, '... -> b ...', b = state.shape[0])
+
+            assert latent.shape[0] == state.shape[0]
+
             gates = self.to_latent_gate(state)
-            latent = einsum(latent, gates, 'n g, b n -> b g')
+            latent = einsum(latent, gates, 'b n g, b n -> b g')
+
+        elif fetching_multiple_latents:
+            latent = latent[:, 0]
         else:
-            assert latent.shape[0] == 1
             latent = latent[0]
 
         if not exists(net):

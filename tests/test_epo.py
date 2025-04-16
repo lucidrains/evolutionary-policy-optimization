@@ -8,8 +8,10 @@ from evolutionary_policy_optimization import (
 )
 
 @pytest.mark.parametrize('num_latent_sets', (1, 4))
+@pytest.mark.parametrize('latent_ids', (2, (2, 4)))
 def test_readme(
-    num_latent_sets
+    num_latent_sets,
+    latent_ids
 ):
 
     latent_pool = LatentGenePool(
@@ -19,12 +21,12 @@ def test_readme(
         num_latent_sets = num_latent_sets
     )
 
-    state = torch.randn(1, 512)
+    state = torch.randn(2, 512)
 
     actor = Actor(dim_state = 512, dim_hiddens = (256, 128), num_actions = 4, dim_latent = 32)
     critic = Critic(dim_state = 512, dim_hiddens = (256, 128, 64), dim_latent = 32)
 
-    latent = latent_pool(latent_id = 2, state = state)
+    latent = latent_pool(latent_id = latent_ids, state = state)
 
     actions = actor(state, latent)
     value = critic(state, latent)
@@ -37,8 +39,10 @@ def test_readme(
 
     latent_pool.genetic_algorithm_step(fitness) # update once
 
-
-def test_create_agent():
+@pytest.mark.parametrize('latent_ids', (2, (2, 4)))
+def test_create_agent(
+    latent_ids
+):
     from evolutionary_policy_optimization import create_agent
 
     agent = create_agent(
@@ -50,10 +54,10 @@ def test_create_agent():
         critic_dim_hiddens = (256, 128, 64)
     )
 
-    state = torch.randn(1, 512)
+    state = torch.randn(2, 512)
 
-    actions = agent.get_actor_actions(state, latent_id = 3)
-    value = agent.get_critic_values(state, latent_id = 3)
+    actions = agent.get_actor_actions(state, latent_id = latent_ids)
+    value = agent.get_critic_values(state, latent_id = latent_ids)
 
     # interact with environment and receive rewards, termination etc
 

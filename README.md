@@ -19,7 +19,6 @@ $ pip install evolutionary-policy-optimization
 ## Usage
 
 ```python
-
 import torch
 
 from evolutionary_policy_optimization import (
