@@ -13,7 +13,6 @@ Update: I see, mixing genetic algorithms with gradient based method is already a
 ## Usage
 
 ```python
-
 import torch
 
 from evolutionary_policy_optimization import (
