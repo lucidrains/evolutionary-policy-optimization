@@ -303,7 +303,6 @@ class LatentGenePool(Module):
         self,
         num_latents,                     # same as gene pool size
         dim_latent,                      # gene dimension
-        num_latent_sets = 1,             # allow for sets of latents / gene per individual, expression of a set controlled by the environment
         num_islands = 1,                 # add the island strategy, which has been effectively used in a few recent works
         dim_state = None,
         frozen_latents = True,
@@ -320,28 +319,16 @@ class LatentGenePool(Module):
 
         maybe_l2norm = l2norm if l2norm_latent else identity
 
-        latents = torch.randn(num_latents, num_latent_sets, dim_latent)
+        latents = torch.randn(num_latents, dim_latent)
 
         if l2norm_latent:
             latents = maybe_l2norm(latents, dim = -1)
 
         self.num_latents = num_latents
-        self.needs_latent_gate = num_latent_sets > 1
+        self.frozen_latents = frozen_latents
         self.latents = nn.Parameter(latents, requires_grad = not frozen_latents)
 
         self.maybe_l2norm = maybe_l2norm
-
-        # gene expression as a function of environment
-
-        self.num_latent_sets = num_latent_sets
-
-        if self.needs_latent_gate:
-            assert exists(dim_state), '`dim_state` must be passed in if using gated gene expression'
-
-        self.to_latent_gate = nn.Sequential(
-            Linear(dim_state, num_latent_sets),
-            nn.Softmax(dim = -1)
-        ) if self.needs_latent_gate else None
 
         # some derived values
 
@@ -378,7 +365,6 @@ class LatentGenePool(Module):
         beta0 = 2.,           # exploitation factor, moving fireflies of low light intensity to high
         gamma = 1.,           # controls light intensity decay over distance - setting this to zero will make firefly equivalent to vanilla PSO
         alpha = 0.1,          # exploration factor
-        alpha_decay = 0.995,  # exploration decay each step
         inplace = True,
     ):
         islands = self.num_islands
@@ -460,7 +446,7 @@ class LatentGenePool(Module):
 
             return genes
 
-        genes = rearrange(genes, '(i p) n g -> i p n g', i = islands)
+        genes = rearrange(genes, '(i p) ... -> i p ...', i = islands)
 
         orig_genes = genes
 
@@ -469,7 +455,7 @@ class LatentGenePool(Module):
 
         sorted_indices = fitness.sort(dim = -1).indices
         natural_selected_indices = sorted_indices[..., -self.num_natural_selected:]
-        natural_select_gene_indices = repeat(natural_selected_indices, '... -> ... n g', n = genes.shape[-2], g = genes.shape[-1])
+        natural_select_gene_indices = repeat(natural_selected_indices, '... -> ... g', g = genes.shape[-1])
 
         genes, fitness = genes.gather(1, natural_select_gene_indices), fitness.gather(1, natural_selected_indices)
 
@@ -484,7 +470,7 @@ class LatentGenePool(Module):
         parent_indices_at_tournament = participant_fitness.topk(2, dim = -1).indices
         parent_gene_ids = rand_tournament_gene_ids.gather(-1, parent_indices_at_tournament)
 
-        parent_gene_ids_for_gather = repeat(parent_gene_ids, 'i p parents -> i (p parents) n g', n = genes.shape[-2], g = genes.shape[-1])
+        parent_gene_ids_for_gather = repeat(parent_gene_ids, 'i p parents -> i (p parents) g', g = genes.shape[-1])
 
         parents = genes.gather(1, parent_gene_ids_for_gather)
         parents = rearrange(parents, 'i (p parents) ... -> i p parents ...', parents = 2)
@@ -555,22 +541,6 @@ class LatentGenePool(Module):
 
         latent = self.latents[latent_id]
 
-        if self.needs_latent_gate:
-            assert exists(state), 'state must be passed in if greater than number of 1 latent set'
-
-            if not fetching_multiple_latents:
-                latent = repeat(latent, '... -> b ...', b = state.shape[0])
-
-            assert latent.shape[0] == state.shape[0]
-
-            gates = self.to_latent_gate(state)
-            latent = einsum(latent, gates, 'b n g, b n -> b g')
-
-        elif fetching_multiple_latents:
-            latent = latent[:, 0]
-        else:
-            latent = latent[0]
-
         latent = self.maybe_l2norm(latent)
 
         if not exists(net):
@@ -612,7 +582,7 @@ class Agent(Module):
         self.actor_optim = optim_klass(actor.parameters(), lr = actor_lr, **actor_optim_kwargs)
         self.critic_optim = optim_klass(critic.parameters(), lr = critic_lr, **critic_optim_kwargs)
 
-        self.latent_optim = optim_klass(latent_gene_pool.parameters(), lr = latent_lr, **latent_optim_kwargs) if latent_gene_pool.needs_latent_gate else None
+        self.latent_optim = optim_klass(latent_gene_pool.parameters(), lr = latent_lr, **latent_optim_kwargs) if not latent_gene_pool.frozen_latents else None
 
     def get_actor_actions(
         self,
@@ -687,7 +657,6 @@ def create_agent(
     actor_num_actions,
     actor_dim_hiddens: int | tuple[int, ...],
     critic_dim_hiddens: int | tuple[int, ...],
-    num_latent_sets = 1
 ) -> Agent:
 
     actor = Actor(
@@ -707,7 +676,6 @@ def create_agent(
         dim_state = dim_state,
         num_latents = num_latents,
         dim_latent = dim_latent,
-        num_latent_sets = num_latent_sets
     )
 
     return Agent(actor = actor, critic = critic, latent_gene_pool = latent_gene_pool)

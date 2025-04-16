@@ -7,11 +7,9 @@ from evolutionary_policy_optimization import (
     Critic
 )
 
-@pytest.mark.parametrize('num_latent_sets', (1, 4))
 @pytest.mark.parametrize('latent_ids', (2, (2, 4)))
 @pytest.mark.parametrize('num_islands', (1, 4))
 def test_readme(
-    num_latent_sets,
     latent_ids,
     num_islands
 ):
@@ -21,7 +19,6 @@ def test_readme(
         dim_latent = 32,
         dim_state = 512,
         num_islands = num_islands,
-        num_latent_sets = num_latent_sets
     )
 
     state = torch.randn(2, 512)
@@ -41,6 +38,8 @@ def test_readme(
     fitness = torch.randn(128)
 
     latent_pool.genetic_algorithm_step(fitness) # update once
+
+    latent_pool.firefly_step(fitness)
 
 @pytest.mark.parametrize('latent_ids', (2, (2, 4)))
 def test_create_agent(
