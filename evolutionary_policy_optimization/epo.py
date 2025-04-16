@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleList
 from torch.utils.data import TensorDataset, DataLoader
 
+import einx
 from einops import rearrange, repeat, einsum
 from einops.layers.torch import Rearrange
 
@@ -293,7 +294,7 @@ class ShouldRunGeneticAlgorithm(Module):
         # however, this equation does not make much sense to me if fitness increases unbounded
         # just let it be customizable, and offer a variant where mean and variance is over some threshold (could account for skew too)
 
-        return (fitnesses.amax() - fitnesses.amin()) > (self.gamma * torch.median(fitnesses))
+        return (fitnesses.amax(dim = -1) - fitnesses.amin(dim = -1)) > (self.gamma * torch.median(fitnesses, dim = -1).values)
 
 # classes
 
@@ -389,9 +390,6 @@ class LatentGenePool(Module):
         islands = self.num_islands
         tournament_participants = self.num_tournament_participants
 
-        if not self.should_run_genetic_algorithm(fitness):
-            return
-
         assert self.num_latents > 1
 
         genes = self.latents # the latents are the genes
@@ -399,12 +397,25 @@ class LatentGenePool(Module):
         pop_size = genes.shape[0]
         assert pop_size == fitness.shape[0]
 
+        pop_size_per_island = pop_size // islands
+
         # split out the islands
 
-        genes = rearrange(genes, '(i p) n g -> i p n g', i = islands)
         fitness = rearrange(fitness, '(i p) -> i p', i = islands)
 
-        pop_size_per_island = pop_size // islands
+        # from the fitness, decide whether to actually run the genetic algorithm or not
+
+        should_update_per_island = self.should_run_genetic_algorithm(fitness)
+
+        if not should_update_per_island.any():
+            if inplace:
+                return
+
+            return genes
+
+        genes = rearrange(genes, '(i p) n g -> i p n g', i = islands)
+
+        orig_genes = genes
 
         # 1. natural selection is simple in silico
         # you sort the population by the fitness and slice off the least fit end
@@ -455,6 +466,10 @@ class LatentGenePool(Module):
             genes = cat((genes, elites), dim = 1)
 
         genes = self.maybe_l2norm(genes)
+
+        # account for criteria of whether to actually run GA or not
+
+        genes = einx.where('i, i ..., i ...', should_update_per_island, genes, orig_genes)
 
         # merge island back into pop dimension
 
