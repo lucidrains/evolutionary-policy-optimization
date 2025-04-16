@@ -477,6 +477,8 @@ class LatentGenePool(Module):
         else:
             latent = latent[0]
 
+        latent = self.maybe_l2norm(latent)
+
         if not exists(net):
             return latent
 
