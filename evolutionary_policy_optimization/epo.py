@@ -301,6 +301,7 @@ class LatentGenePool(Module):
         dim_latent,                      # gene dimension
         num_latent_sets = 1,             # allow for sets of latents / gene per individual, expression of a set controlled by the environment
         dim_state = None,
+        frozen_latents = True,
         crossover_random = True,         # random interp from parent1 to parent2 for crossover, set to `False` for averaging (0.5 constant value)
         l2norm_latent = False,           # whether to enforce latents on hypersphere,
         frac_tournaments = 0.25,         # fraction of genes to participate in tournament - the lower the value, the more chance a less fit gene could be selected
@@ -321,7 +322,7 @@ class LatentGenePool(Module):
 
         self.num_latents = num_latents
         self.needs_latent_gate = num_latent_sets > 1
-        self.latents = nn.Parameter(latents, requires_grad = False)
+        self.latents = nn.Parameter(latents, requires_grad = not frozen_latents)
 
         self.maybe_l2norm = maybe_l2norm
 
