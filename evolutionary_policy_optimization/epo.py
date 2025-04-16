@@ -372,6 +372,53 @@ class LatentGenePool(Module):
 
         self.should_run_genetic_algorithm = should_run_genetic_algorithm
 
+    def firefly_step(
+        self,
+        fitness,
+        beta0 = 2.,           # exploitation factor, moving fireflies of low light intensity to high
+        gamma = 1.,           # controls light intensity decay over distance - setting this to zero will make firefly equivalent to vanilla PSO
+        alpha = 0.1,          # exploration factor
+        alpha_decay = 0.995,  # exploration decay each step
+        inplace = True,
+    ):
+        islands = self.num_islands
+        fireflies = self.latents # the latents are the fireflies
+
+        assert fitness.shape[0] == fireflies.shape[0]
+
+        fitness = rearrange(fitness, '(i p) -> i p', i = islands)
+        fireflies = rearrange(fireflies, '(i p) ... -> i p ...', i = islands)
+
+        # fireflies with lower light intensity (high cost) moves towards the higher intensity (lower cost)
+
+        move_mask = einx.less('i x, i y -> i x y', fitness, fitness)
+
+        # get vectors of fireflies to one another
+        # calculate distance and the beta
+
+        delta_positions = einx.subtract('i y ... d, i x ... d -> i x y ... d', fireflies, fireflies)
+
+        distance = delta_positions.norm(dim = -1)
+
+        betas = beta0 * (-gamma * distance ** 2).exp()
+
+        # move the fireflies according to attraction
+
+        fireflies += einsum(move_mask, betas, delta_positions, 'i x y, i x y ..., i x y ... -> i x ...')
+
+        # merge back the islands
+
+        fireflies = rearrange(fireflies, 'i p ... -> (i p) ...')
+
+        # maybe fireflies on hypersphere
+
+        fireflies = self.maybe_l2norm(fireflies)
+
+        if not inplace:
+            return fireflies
+
+        self.latents.copy_(fireflies)
+
     @torch.no_grad()
     # non-gradient optimization, at least, not on the individual level (taken care of by rl component)
     def genetic_algorithm_step(
