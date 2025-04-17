@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 from collections import namedtuple
 
@@ -68,7 +69,6 @@ def calc_generalized_advantage_estimate(
     gamma = 0.99,
     lam = 0.95,
     use_accelerated = None
-
 ):
     assert values.shape[-1] == (rewards.shape[-1] + 1)
 
@@ -605,6 +605,16 @@ class Agent(Module):
         critic_lr = 1e-4,
         latent_lr = 1e-5,
         critic_ema_beta = 0.99,
+        batch_size = 16,
+        calc_gae_kwargs: dict = dict(
+            use_accelerated = False,
+            gamma = 0.99,
+            lam = 0.95,
+        ),
+        actor_loss_kwargs: dict = dict(
+            eps_clip = 0.2,
+            entropy_weight = .01
+        ),
         ema_kwargs: dict = dict(),
         actor_optim_kwargs: dict = dict(),
         critic_optim_kwargs: dict = dict(),
@@ -621,6 +631,13 @@ class Agent(Module):
         self.latent_gene_pool = latent_gene_pool
 
         assert actor.dim_latent == critic.dim_latent == latent_gene_pool.dim_latent
+
+        # gae function
+
+        self.actor_loss = partial(actor_loss, **actor_loss_kwargs)
+        self.calc_gae = partial(calc_generalized_advantage_estimate, **calc_gae_kwargs)
+
+        self.batch_size = batch_size
 
         # optimizers
 
@@ -690,11 +707,58 @@ class Agent(Module):
 
     def forward(
         self,
-        memories_and_next_value: MemoriesAndNextValue
+        memories_and_next_value: MemoriesAndNextValue,
+        epochs = 2
     ):
         memories, next_value = memories_and_next_value
 
-        raise NotImplementedError
+        (
+            states,
+            latent_gene_ids,
+            actions,
+            log_probs,
+            rewards,
+            values,
+            dones
+        ) = map(stack, zip(*memories))
+
+        values_with_next, ps = pack((values, next_value), '*')
+
+        advantages = self.calc_gae(rewards, values_with_next, dones)
+
+        dataset = TensorDataset(states, latent_gene_ids, actions, log_probs, advantages, values)
+
+        dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
+
+        self.actor.train()
+        self.critic.train()
+
+        for _ in range(epochs):
+            for (
+                states,
+                latent_gene_ids,
+                actions,
+                log_probs,
+                advantages,
+                old_values
+            ) in dataloader:
+
+                # learn actor
+
+                logits = self.actor(states)
+                actor_loss = self.actor_loss(logits, log_probs, actions, advantages)
+
+                actor_loss.backward()
+                self.actor_optim.step()
+                self.actor_optim.zero_grad()
+
+                # learn critic with maybe classification loss
+
+                critic_loss = self.critic(states, advantages + old_values)
+                critic_loss.backward()
+
+                self.critic_optim.step()
+                self.critic_optim.zero_grad()
 
 # reinforcement learning related - ppo
 
