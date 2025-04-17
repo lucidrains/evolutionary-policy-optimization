@@ -68,3 +68,8 @@ def test_create_agent(
     fitness = torch.randn(128)
 
     agent.update_latent_gene_pool_(fitness) # update once
+
+    # saving and loading
+
+    agent.save('./agent.pt', overwrite = True)
+    agent.load('./agent.pt')

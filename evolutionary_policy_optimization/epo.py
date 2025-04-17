@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from collections import namedtuple
 
 import torch
@@ -605,6 +606,39 @@ class Agent(Module):
         self.critic_optim = optim_klass(critic.parameters(), lr = critic_lr, **critic_optim_kwargs)
 
         self.latent_optim = optim_klass(latent_gene_pool.parameters(), lr = latent_lr, **latent_optim_kwargs) if not latent_gene_pool.frozen_latents else None
+
+    def save(self, path, overwrite = False):
+        path = Path(path)
+
+        assert not path.exists() or overwrite
+
+        pkg = dict(
+            actor = self.actor.state_dict(),
+            critic = self.critic.state_dict(),
+            latents = self.latent_gene_pool.state_dict(),
+            actor_optim = self.actor_optim.state_dict(),
+            critic_optim = self.critic_optim.state_dict(),
+            latent_optim = self.latent_optim.state_dict() if exists(self.latent_optim) else None
+        )
+
+        torch.save(pkg, str(path))
+
+    def load(self, path):
+        path = Path(path)
+
+        assert path.exists()
+
+        pkg = torch.load(str(path), weights_only = True)
+
+        self.actor.load_state_dict(pkg['actor'])
+        self.critic.load_state_dict(pkg['critic'])
+        self.latent_gene_pool.load_state_dict(pkg['latents'])
+
+        self.actor_optim.load_state_dict(pkg['actor_optim'])
+        self.critic_optim.load_state_dict(pkg['critic_optim'])
+
+        if exists(pkg.get('latent_optim', None)):
+            self.latent_optim.load_state_dict(pkg['latent_optim'])
 
     def get_actor_actions(
         self,
