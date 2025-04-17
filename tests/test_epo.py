@@ -37,7 +37,7 @@ def test_readme(
 
     fitness = torch.randn(128)
 
-    latent_pool.genetic_algorithm_step(fitness) # update once
+    latent_pool.genetic_algorithm_step(fitness, migrate = num_islands > 1) # update once
 
     latent_pool.firefly_step(fitness)
 
