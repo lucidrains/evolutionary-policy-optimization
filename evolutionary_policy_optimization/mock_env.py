@@ -21,12 +21,16 @@ class Env(Module):
 
     def reset(
         self
-    ) -> State:
-        return randn(self.state_shape, device = self.device)
+    ):
+        state = randn(self.state_shape, device = self.device)
+        return state
 
     def forward(
         self,
-        actions: Int['a'],
-    ) -> State:
+        actions,
+    ):
+        state = randn(self.state_shape, device = self.device)
+        reward = randint(0, 5, (), device = self.device).float()
+        done = zeros((), device = self.device, dtype = torch.bool)
 
-        return randn(self.state_shape, device = self.device)
+        return state, reward, done
