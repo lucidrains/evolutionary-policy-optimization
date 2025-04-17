@@ -664,8 +664,10 @@ class Agent(Module):
 
     def forward(
         self,
-        memories: list[Memory]
+        memories_and_next_value: MemoriesAndNextValue
     ):
+        memories, next_value = memories_and_next_value
+
         raise NotImplementedError
 
 # reinforcement learning related - ppo
@@ -749,6 +751,11 @@ Memory = namedtuple('Memory', [
     'done'
 ])
 
+MemoriesAndNextValue = namedtuple('MemoriesAndNextValue', [
+    'memories',
+    'next_value'
+])
+
 class EPO(Module):
 
     def __init__(
@@ -761,6 +768,6 @@ class EPO(Module):
     def forward(
         self,
         env
-    ) -> list[Memory]:
+    ) -> MemoriesAndNextValue:
 
         raise NotImplementedError
