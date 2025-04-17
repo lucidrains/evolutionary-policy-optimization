@@ -245,6 +245,13 @@ class Critic(Module):
         dim_state,
         dim_hiddens: tuple[int, ...],
         dim_latent = 0,
+        use_regression = False,
+        hl_gauss_loss_kwargs: dict = dict(
+            min_value = -10.,
+            max_value = 10.,
+            num_bins = 25,
+            sigma = 0.5
+        )
     ):
         super().__init__()
 
@@ -260,23 +267,28 @@ class Critic(Module):
 
         self.mlp = MLP(dims = dim_hiddens, dim_latent = dim_latent)
 
-        self.to_out = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(dim_last, 1),
-            Rearrange('... 1 -> ...')
+        self.final_act = nn.SiLU()
+
+        self.to_pred = HLGaussLayer(
+            dim = dim_last,
+            use_regression = False,
+            hl_gauss_loss = hl_gauss_loss_kwargs
         )
 
     def forward(
         self,
         state,
-        latent
+        latent,
+        target = None
     ):
 
         hidden = self.init_layer(state)
 
         hidden = self.mlp(hidden, latent)
 
-        return self.to_out(hidden)
+        hidden = self.final_act(hidden)
+
+        return self.to_pred(hidden, target = target)
 
 # criteria for running genetic algorithm
 
