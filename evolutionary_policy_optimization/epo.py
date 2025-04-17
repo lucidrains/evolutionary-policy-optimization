@@ -596,6 +596,7 @@ class Agent(Module):
         self.actor = actor
         self.critic = critic
 
+        self.num_latents = latent_gene_pool.num_latents
         self.latent_gene_pool = latent_gene_pool
 
         assert actor.dim_latent == critic.dim_latent == latent_gene_pool.dim_latent
