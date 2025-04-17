@@ -19,6 +19,8 @@ from adam_atan2_pytorch import AdoptAtan2
 
 from hl_gauss_pytorch import HLGaussLayer
 
+from ema_pytorch import EMA
+
 # helpers
 
 def exists(v):
@@ -599,6 +601,8 @@ class Agent(Module):
         actor_lr = 1e-4,
         critic_lr = 1e-4,
         latent_lr = 1e-5,
+        critic_ema_beta = 0.99,
+        ema_kwargs: dict = dict(),
         actor_optim_kwargs: dict = dict(),
         critic_optim_kwargs: dict = dict(),
         latent_optim_kwargs: dict = dict(),
@@ -606,7 +610,9 @@ class Agent(Module):
         super().__init__()
 
         self.actor = actor
+
         self.critic = critic
+        self.critic_ema = EMA(critic, beta = critic_ema_beta, include_online_model = False, **ema_kwargs)
 
         self.num_latents = latent_gene_pool.num_latents
         self.latent_gene_pool = latent_gene_pool
@@ -628,6 +634,7 @@ class Agent(Module):
         pkg = dict(
             actor = self.actor.state_dict(),
             critic = self.critic.state_dict(),
+            critic_ema = self.critic_ema.state_dict(),
             latents = self.latent_gene_pool.state_dict(),
             actor_optim = self.actor_optim.state_dict(),
             critic_optim = self.critic_optim.state_dict(),
@@ -644,7 +651,10 @@ class Agent(Module):
         pkg = torch.load(str(path), weights_only = True)
 
         self.actor.load_state_dict(pkg['actor'])
+
         self.critic.load_state_dict(pkg['critic'])
+        self.critic_ema.load_state_dict(pkg['critic_ema'])
+
         self.latent_gene_pool.load_state_dict(pkg['latents'])
 
         self.actor_optim.load_state_dict(pkg['actor_optim'])
