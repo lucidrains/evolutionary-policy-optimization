@@ -311,6 +311,7 @@ class LatentGenePool(Module):
         frac_tournaments = 0.25,         # fraction of genes to participate in tournament - the lower the value, the more chance a less fit gene could be selected
         frac_natural_selected = 0.25,    # number of least fit genes to remove from the pool
         frac_elitism = 0.1,              # frac of population to preserve from being noised
+        frac_migrate = 0.1,              # frac of population, excluding elites, that migrate between islands randomly. will use a designated set migration pattern (since for some reason using random it seems to be worse for me)
         mutation_strength = 1.,          # factor to multiply to gaussian noise as mutation to latents
         should_run_genetic_algorithm: Module | None = None, # eq (3) in paper
         default_should_run_ga_gamma = 1.5
@@ -348,11 +349,15 @@ class LatentGenePool(Module):
         self.num_natural_selected = int(frac_natural_selected * latents_per_island)
 
         self.num_tournament_participants = int(frac_tournaments * self.num_natural_selected)
+
         self.crossover_random  = crossover_random
 
         self.mutation_strength = mutation_strength
         self.num_elites = int(frac_elitism * latents_per_island)
         self.has_elites = self.num_elites > 0
+
+        latents_without_elites = num_latents - self.num_elites
+        self.num_migrate = int(frac_migrate * latents_without_elites)
 
         if not exists(should_run_genetic_algorithm):
             should_run_genetic_algorithm = ShouldRunGeneticAlgorithm(gamma = default_should_run_ga_gamma)
@@ -410,8 +415,11 @@ class LatentGenePool(Module):
     def genetic_algorithm_step(
         self,
         fitness, # Float['p'],
-        inplace = True
+        inplace = True,
+        migrate = False # trigger a migration in the setting of multiple islands, the loop outside will need to have some `migrate_every` hyperparameter
     ):
+        device = self.latents.device
+
         """
         i - islands
         p - population
@@ -461,7 +469,7 @@ class LatentGenePool(Module):
 
         # 2. for finding pairs of parents to replete gene pool, we will go with the popular tournament strategy
 
-        rand_tournament_gene_ids = torch.randn((islands, pop_size_per_island - self.num_natural_selected, tournament_participants)).argsort(dim = -1)
+        rand_tournament_gene_ids = torch.randn((islands, pop_size_per_island - self.num_natural_selected, tournament_participants), device = device).argsort(dim = -1)
         rand_tournament_gene_ids_for_gather = rearrange(rand_tournament_gene_ids, 'i p t -> i (p t)')
 
         participant_fitness = fitness.gather(1, rand_tournament_gene_ids_for_gather)
@@ -492,6 +500,20 @@ class LatentGenePool(Module):
         # 5. mutate with gaussian noise - todo: add drawing the mutation rate from exponential distribution, from the fast genetic algorithms paper from 2017
 
         genes = mutation(genes, mutation_strength = self.mutation_strength)
+
+        # 6. maybe migration
+
+        if migrate:
+            assert self.num_islands > 1
+            randperm = torch.randn(genes.shape[:-1], device = device).argsort(dim = -1)
+
+            migrate_mask = randperm < self.num_migrate
+
+            nonmigrants = rearrange(genes[~migrate_mask], '(i p) g -> i p g', i = islands)
+            migrants = rearrange(genes[migrate_mask], '(i p) g -> i p g', i = islands)
+            migrants = torch.roll(migrants, 1, dims = 0)
+
+            genes = cat((nonmigrants, migrants), dim = 1)
 
         # add back the elites
 
