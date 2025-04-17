@@ -558,6 +558,7 @@ class LatentGenePool(Module):
         state: Tensor | None = None,
         latent_id: int | None = None,
         net: Module | None = None,
+        net_latent_kwarg_name = 'latent',
         **kwargs,
     ):
         device = self.latents.device
@@ -583,9 +584,11 @@ class LatentGenePool(Module):
         if not exists(net):
             return latent
 
+        latent_kwarg = {net_latent_kwarg_name: latent}
+
         return net(
             *args,
-            latent = latent,
+            **latent_kwarg,
             **kwargs
         )
 
