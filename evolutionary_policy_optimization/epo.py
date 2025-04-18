@@ -951,7 +951,7 @@ class EPO(Module):
 
                 done = tensor(False)
 
-                while time < self.max_episode_length:
+                while time < self.max_episode_length and not done:
 
                     # sample action
 
