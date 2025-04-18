@@ -798,6 +798,10 @@ class Agent(Module):
 
                 latents = self.latent_gene_pool(latent_id = latent_gene_ids)
 
+                orig_latents = latents
+                latents = latents.detach()
+                latents.requires_grad_()
+
                 # learn actor
 
                 logits = self.actor(states, latents)
@@ -821,6 +825,14 @@ class Agent(Module):
 
                 self.critic_optim.step()
                 self.critic_optim.zero_grad()
+
+                # maybe update latents, if not frozen
+
+                if not self.latent_gene_pool.frozen_latents:
+                    orig_latents.backward(latents.grad)
+
+                    self.latent_optim.step()
+                    self.latent_optim.zero_grad()
 
         # apply evolution
 
