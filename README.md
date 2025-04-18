@@ -110,4 +110,25 @@ agent.load('./agent.pt')
 }
 ```
 
+```bibtex
+@inproceedings{Khadka2018EvolutionGuidedPG,
+    title   = {Evolution-Guided Policy Gradient in Reinforcement Learning},
+    author  = {Shauharda Khadka and Kagan Tumer},
+    booktitle = {Neural Information Processing Systems},
+    year    = {2018},
+    url     = {https://api.semanticscholar.org/CorpusID:53096951}
+}
+```
+
+```bibtex
+@article{Fortunato2017NoisyNF,
+    title   = {Noisy Networks for Exploration},
+    author  = {Meire Fortunato and Mohammad Gheshlaghi Azar and Bilal Piot and Jacob Menick and Ian Osband and Alex Graves and Vlad Mnih and R{\'e}mi Munos and Demis Hassabis and Olivier Pietquin and Charles Blundell and Shane Legg},
+    journal = {ArXiv},
+    year    = {2017},
+    volume  = {abs/1706.10295},
+    url     = {https://api.semanticscholar.org/CorpusID:5176587}
+}
+```
+
 *Evolution is cleverer than you are.* - Leslie Orgel
