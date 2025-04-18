@@ -36,6 +36,6 @@ class Env(Module):
     ):
         state = randn(self.state_shape, device = self.device)
         reward = randint(0, 5, (), device = self.device).float()
-        done = zeros((), device = self.device, dtype = torch.bool)
+        done = torch.zeros((), device = self.device, dtype = torch.bool)
 
         return state, reward, done

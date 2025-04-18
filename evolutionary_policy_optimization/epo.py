@@ -865,10 +865,13 @@ class EPO(Module):
         self.episodes_per_latent = episodes_per_latent
         self.max_episode_length = max_episode_length
 
+    @torch.no_grad()
     def forward(
         self,
         env
     ) -> MemoriesAndNextValue:
+
+        self.agent.eval()
 
         memories: list[Memory] = []
 
