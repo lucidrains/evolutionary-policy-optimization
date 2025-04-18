@@ -22,6 +22,8 @@ from hl_gauss_pytorch import HLGaussLayer
 
 from ema_pytorch import EMA
 
+from tqdm import tqdm
+
 # helpers
 
 def exists(v):
@@ -47,9 +49,20 @@ def l2norm(t):
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
 
+def gumbel_noise(t):
+    return -log(-log(torch.rand_like(t)))
+
+def gumbel_sample(t, temperature = 1.):
+    is_greedy = temperature <= 0.
+
+    if not is_greedy:
+        t = (t / temperature) + gumbel_noise(t)
+
+    return t.argmax(dim = -1)
+
 def calc_entropy(logits):
     prob = logits.softmax(dim = -1)
-    return -prob * log(prob)
+    return -(prob * log(prob)).sum(dim = -1)
 
 def gather_log_prob(
     logits, # Float[b l]
@@ -63,8 +76,8 @@ def gather_log_prob(
 # generalized advantage estimate
 
 def calc_generalized_advantage_estimate(
-    rewards, # Float[g n]
-    values,  # Float[g n+1]
+    rewards, # Float[n]
+    values,  # Float[n+1]
     masks,   # Bool[n]
     gamma = 0.99,
     lam = 0.95,
@@ -75,9 +88,7 @@ def calc_generalized_advantage_estimate(
     use_accelerated = default(use_accelerated, rewards.is_cuda)
     device = rewards.device
 
-    masks = repeat(masks, 'n -> g n', g = rewards.shape[0])
-
-    values, values_next = values[:, :-1], values[:, 1:]
+    values, values_next = values[:-1], values[1:]
 
     delta = rewards + gamma * values_next * masks - values
     gates = gamma * lam * masks
@@ -565,6 +576,8 @@ class LatentGenePool(Module):
         if not exists(latent_id) and self.num_latents == 1:
             latent_id = 0
 
+        assert exists(latent_id)
+
         if not is_tensor(latent_id):
             latent_id = tensor(latent_id, device = device)
 
@@ -681,17 +694,38 @@ class Agent(Module):
     def get_actor_actions(
         self,
         state,
-        latent_id
+        latent_id = None,
+        latent = None,
+        sample = False,
+        temperature = 1.
     ):
-        latent = self.latent_gene_pool(latent_id = latent_id, state = state)
-        return self.actor(state, latent)
+        assert exists(latent_id) or exists(latent)
+
+        if not exists(latent):
+            latent = self.latent_gene_pool(latent_id = latent_id)
+
+        logits = self.actor(state, latent)
+
+        if not sample:
+            return logits
+
+        actions = gumbel_sample(logits, temperature = temperature)
+
+        log_probs = gather_log_prob(logits, actions)
+
+        return actions, log_probs
 
     def get_critic_values(
         self,
         state,
-        latent_id
+        latent_id = None,
+        latent = None
     ):
-        latent = self.latent_gene_pool(latent_id = latent_id, state = state)
+        assert exists(latent_id) or exists(latent)
+
+        if not exists(latent):
+            latent = self.latent_gene_pool(latent_id = latent_id)
+
         return self.critic(state, latent)
 
     def update_latent_gene_pool_(
@@ -702,13 +736,13 @@ class Agent(Module):
 
     def forward(
         self,
-        memories_and_next_value: MemoriesAndNextValue,
+        memories_and_fitness_scores: MemoriesAndFitnessScores,
         epochs = 2
     ):
-        memories, next_value = memories_and_next_value
+        memories, fitness_scores = memories_and_fitness_scores
 
         (
-            _,
+            episode_ids,
             states,
             latent_gene_ids,
             actions,
@@ -718,35 +752,46 @@ class Agent(Module):
             dones
         ) = map(stack, zip(*memories))
 
-        values_with_next, ps = pack((values, next_value), '*')
+        advantages = self.calc_gae(
+            rewards[:-1],
+            values,
+            dones[:-1],
+        )
 
-        advantages = self.calc_gae(rewards, values_with_next, dones)
+        valid_episode = episode_ids >= 0
 
-        dataset = TensorDataset(states, latent_gene_ids, actions, log_probs, advantages, values)
+        dataset = TensorDataset(
+            *[   
+                advantages[valid_episode[:-1]],
+                *[t[valid_episode] for t in (states, latent_gene_ids, actions, log_probs, values)]
+            ]
+        )
 
         dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
 
         self.actor.train()
         self.critic.train()
 
-        for _ in range(epochs):
+        for _ in tqdm(range(epochs), desc = 'learning actor/critic epoch'):
             for (
+                advantages,
                 states,
                 latent_gene_ids,
                 actions,
                 log_probs,
-                advantages,
                 old_values
             ) in dataloader:
 
-                latents = self.latent_gene_pool(latent_gene_ids)
+                latents = self.latent_gene_pool(latent_id = latent_gene_ids)
 
                 # learn actor
 
                 logits = self.actor(states, latents)
+
                 actor_loss = self.actor_loss(logits, log_probs, actions, advantages)
 
                 actor_loss.backward()
+
                 self.actor_optim.step()
                 self.actor_optim.zero_grad()
 
@@ -755,13 +800,17 @@ class Agent(Module):
                 critic_loss = self.critic(
                     states,
                     latents,
-                    targets = advantages + old_values
+                    target = advantages + old_values
                 )
 
                 critic_loss.backward()
 
                 self.critic_optim.step()
                 self.critic_optim.zero_grad()
+
+        # apply evolution
+
+        self.latent_gene_pool.genetic_algorithm_step(fitness_scores)
 
 # reinforcement learning related - ppo
 
@@ -789,15 +838,7 @@ def actor_loss(
 
     entropy_aux_loss = -entropy_weight * entropy
 
-    return actor_loss + entropy_aux_loss
-
-def critic_loss(
-    pred_values,  # Float[b]
-    advantages,   # Float[b]
-    old_values    # Float[b]
-):
-    discounted_values = advantages + old_values
-    return F.mse_loss(pred_values, discounted_values)
+    return (actor_loss + entropy_aux_loss).mean()
 
 # agent contains the actor, critic, and the latent genetic pool
 
@@ -810,6 +851,11 @@ def create_agent(
     critic_dim_hiddens: int | tuple[int, ...],
 ) -> Agent:
 
+    latent_gene_pool = LatentGenePool(
+        num_latents = num_latents,
+        dim_latent = dim_latent
+    )
+
     actor = Actor(
         num_actions = actor_num_actions,
         dim_state = dim_state,
@@ -821,13 +867,7 @@ def create_agent(
         dim_state = dim_state,
         dim_latent = dim_latent,
         dim_hiddens = critic_dim_hiddens
-    )
-
-    latent_gene_pool = LatentGenePool(
-        num_latents = num_latents,
-        dim_latent = dim_latent,
-    )
-
+    )                
     return Agent(actor = actor, critic = critic, latent_gene_pool = latent_gene_pool)
 
 # EPO - which is just PPO with natural selection of a population of latent variables conditioning the agent
@@ -840,14 +880,13 @@ Memory = namedtuple('Memory', [
     'action',
     'log_prob',
     'reward',
-    'values',
+    'value',
     'done'
 ])
 
-MemoriesAndNextValue = namedtuple('MemoriesAndNextValue', [
+MemoriesAndFitnessScores = namedtuple('MemoriesAndFitnessScores', [
     'memories',
-    'next_value',
-    'cumulative_rewards'
+    'fitness_scores'
 ])
 
 class EPO(Module):
@@ -856,10 +895,12 @@ class EPO(Module):
         self,
         agent: Agent,
         episodes_per_latent,
-        max_episode_length
+        max_episode_length,
+        action_sample_temperature = 1.
     ):
         super().__init__()
         self.agent = agent
+        self.action_sample_temperature = action_sample_temperature
 
         self.num_latents = agent.latent_gene_pool.num_latents
         self.episodes_per_latent = episodes_per_latent
@@ -869,10 +910,90 @@ class EPO(Module):
     def forward(
         self,
         env
-    ) -> MemoriesAndNextValue:
+    ) -> MemoriesAndFitnessScores:
 
         self.agent.eval()
 
+        invalid_episode = tensor(-1) # will use `episode_id` value of `-1` for the `next_value`, needed for not discarding last reward for generalized advantage estimate
+
         memories: list[Memory] = []
 
-        raise NotImplementedError
+        fitness_scores = torch.zeros((self.num_latents))
+
+        for episode_id in tqdm(range(self.episodes_per_latent), desc = 'episode'):
+
+            for latent_id in tqdm(range(self.num_latents), desc = 'latent'):
+                time = 0
+
+                # initial state
+
+                state = env.reset()
+
+                # get latent from pool
+
+                latent = self.agent.latent_gene_pool(latent_id = latent_id)
+
+                # until maximum episode length
+
+                done = tensor(False)
+
+                while time < self.max_episode_length:
+
+                    batched_state = rearrange(state, '... -> 1 ...')
+
+                    # sample action
+
+                    action, log_prob = self.agent.get_actor_actions(batched_state, latent = latent, sample = True, temperature = self.action_sample_temperature)
+
+                    action = rearrange(action, '1 ... -> ...')
+                    log_prob = rearrange(log_prob, '1 ... -> ...')
+
+                    # values
+
+                    value = self.agent.get_critic_values(batched_state, latent = latent)
+
+                    value = rearrange(value, '1 ... -> ...')
+
+                    # get the next state, action, and reward
+
+                    state, reward, done = env(action)
+
+                    # update fitness for each gene as cumulative reward received, but make this customizable at some point
+
+                    fitness_scores[latent_id] += reward
+                    
+                    # store memories
+
+                    memory = Memory(
+                        tensor(episode_id),
+                        state,
+                        tensor(latent_id),
+                        action,
+                        log_prob,
+                        reward,
+                        value,
+                        done
+                    )
+
+                    memories.append(memory)
+
+                    time += 1
+
+                # need the final next value for GAE, iiuc
+
+                batched_state = rearrange(state, '... -> 1 ...')
+
+                next_value = self.agent.get_critic_values(batched_state, latent = latent)
+                next_value = rearrange(next_value, '1 ... -> ...')
+
+                memory_for_gae = memory._replace(
+                    episode_id = invalid_episode,
+                    value = next_value
+                )
+
+                memories.append(memory_for_gae)
+
+        return MemoriesAndFitnessScores(
+            memories = memories,
+            fitness_scores = fitness_scores
+        )

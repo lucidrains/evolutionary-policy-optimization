@@ -49,6 +49,45 @@ fitness = torch.randn(128)
 latent_pool.genetic_algorithm_step(fitness) # update latent genes with genetic algorithm
 ```
 
+End to end learning
+
+```python
+import torch
+
+from evolutionary_policy_optimization import (
+    create_agent,
+    EPO,
+    Env
+)
+
+agent = create_agent(
+    dim_state = 512,
+    num_latents = 8,
+    dim_latent = 32,
+    actor_num_actions = 5,
+    actor_dim_hiddens = (256, 128),
+    critic_dim_hiddens = (256, 128, 64)
+)
+
+epo = EPO(
+    agent,
+    episodes_per_latent = 1,
+    max_episode_length = 10,
+    action_sample_temperature = 1.
+)
+
+env = Env((512,))
+
+memories = epo(env)
+
+agent(memories)
+
+# saving and loading
+
+agent.save('./agent.pt', overwrite = True)
+agent.load('./agent.pt')
+```
+
 ## Citations
 
 ```bibtex
