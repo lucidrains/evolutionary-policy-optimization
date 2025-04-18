@@ -16,8 +16,7 @@ def test_readme(
 
     latent_pool = LatentGenePool(
         num_latents = 128,
-        dim_latent = 32,
-        dim_state = 512,
+        dim_latent = 32,        
         num_islands = num_islands,
     )
 

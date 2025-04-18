@@ -5,13 +5,13 @@ from pathlib import Path
 from collections import namedtuple
 
 import torch
-from torch import nn, cat, is_tensor, tensor
+from torch import nn, cat, stack, is_tensor, tensor
 import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleList
 from torch.utils.data import TensorDataset, DataLoader
 
 import einx
-from einops import rearrange, repeat, einsum
+from einops import rearrange, repeat, einsum, pack
 from einops.layers.torch import Rearrange
 
 from assoc_scan import AssocScan
@@ -319,7 +319,6 @@ class LatentGenePool(Module):
         num_latents,                     # same as gene pool size
         dim_latent,                      # gene dimension
         num_islands = 1,                 # add the island strategy, which has been effectively used in a few recent works
-        dim_state = None,
         frozen_latents = True,
         crossover_random = True,         # random interp from parent1 to parent2 for crossover, set to `False` for averaging (0.5 constant value)
         l2norm_latent = False,           # whether to enforce latents on hypersphere,
@@ -384,7 +383,6 @@ class LatentGenePool(Module):
         fitness,
         beta0 = 2.,           # exploitation factor, moving fireflies of low light intensity to high
         gamma = 1.,           # controls light intensity decay over distance - setting this to zero will make firefly equivalent to vanilla PSO
-        alpha = 0.1,          # exploration factor
         inplace = True,
     ):
         islands = self.num_islands
@@ -555,7 +553,6 @@ class LatentGenePool(Module):
     def forward(
         self,
         *args,
-        state: Tensor | None = None,
         latent_id: int | None = None,
         net: Module | None = None,
         net_latent_kwarg_name = 'latent',
@@ -574,8 +571,6 @@ class LatentGenePool(Module):
         assert (0 <= latent_id).all() and (latent_id < self.num_latents).all()
 
         # fetch latent
-
-        fetching_multiple_latents = latent_id.numel() > 1
 
         latent = self.latents[latent_id]
 
@@ -713,6 +708,7 @@ class Agent(Module):
         memories, next_value = memories_and_next_value
 
         (
+            _,
             states,
             latent_gene_ids,
             actions,
@@ -785,7 +781,7 @@ def actor_loss(
 
     clipped_ratio = ratio.clamp(min = 1. - eps_clip, max = 1. + eps_clip)
 
-    actor_loss = -torch.min(clipped_ratio * advantage, ratio * advantage)
+    actor_loss = -torch.min(clipped_ratio * advantages, ratio * advantages)
 
     # add entropy loss for exploration
 
@@ -828,7 +824,6 @@ def create_agent(
     )
 
     latent_gene_pool = LatentGenePool(
-        dim_state = dim_state,
         num_latents = num_latents,
         dim_latent = dim_latent,
     )
@@ -839,6 +834,7 @@ def create_agent(
 # the tricky part is that the latent ids for each episode / trajectory needs to be tracked
 
 Memory = namedtuple('Memory', [
+    'episode_id',
     'state',
     'latent_gene_id',
     'action',
@@ -850,21 +846,30 @@ Memory = namedtuple('Memory', [
 
 MemoriesAndNextValue = namedtuple('MemoriesAndNextValue', [
     'memories',
-    'next_value'
+    'next_value',
+    'cumulative_rewards'
 ])
 
 class EPO(Module):
 
     def __init__(
         self,
-        agent: Agent
+        agent: Agent,
+        episodes_per_latent,
+        max_episode_length
     ):
         super().__init__()
         self.agent = agent
+
+        self.num_latents = agent.latent_gene_pool.num_latents
+        self.episodes_per_latent = episodes_per_latent
+        self.max_episode_length = max_episode_length
 
     def forward(
         self,
         env
     ) -> MemoriesAndNextValue:
+
+        memories: list[Memory] = []
 
         raise NotImplementedError

@@ -8,8 +8,6 @@ This paper stands out, as I have witnessed the positive effects first hand in an
 
 Besides their latent variable strategy, I'll also throw in some attempts with crossover in weight space
 
-Update: I see, mixing genetic algorithms with gradient based method is already a research field, under [Memetic algorithms](https://en.wikipedia.org/wiki/Memetic_algorithm)
-
 ## Install
 
 ```bash

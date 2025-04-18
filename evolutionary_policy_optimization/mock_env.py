@@ -4,15 +4,20 @@ import torch
 from torch import tensor, randn, randint
 from torch.nn import Module
 
+# functions
+
+def cast_tuple(v):
+    return v if isinstance(v, tuple) else v\
+
 # mock env
 
 class Env(Module):
     def __init__(
         self,
-        state_shape: tuple[int, ...]
+        state_shape: int | tuple[int, ...]
     ):
         super().__init__()
-        self.state_shape = state_shape
+        self.state_shape = cast_tuple(state_shape)
         self.register_buffer('dummy', tensor(0))
 
     @property

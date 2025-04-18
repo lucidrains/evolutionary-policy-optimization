@@ -4,5 +4,8 @@ from evolutionary_policy_optimization.epo import (
     Critic,
     create_agent,
     Agent,
-    LatentGenePool
+    LatentGenePool,
+    EPO
 )
+
+from evolutionary_policy_optimization.mock_env import Env
