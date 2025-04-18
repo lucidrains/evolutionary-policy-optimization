@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from collections import namedtuple
 
@@ -9,6 +9,7 @@ from torch import nn, cat, stack, is_tensor, tensor
 import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleList
 from torch.utils.data import TensorDataset, DataLoader
+from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 
 import einx
 from einops import rearrange, repeat, einsum, pack
@@ -72,6 +73,19 @@ def gather_log_prob(
     log_probs = logits.log_softmax(dim = -1)
     log_prob = log_probs.gather(-1, indices)
     return rearrange(log_prob, '... 1 -> ...')
+
+def temp_batch_dim(fn):
+
+    @wraps(fn)
+    def inner(*args, **kwargs):
+        args, kwargs = tree_map(lambda t: rearrange(t, '... -> 1 ...') if is_tensor(t) else t, (args, kwargs))
+
+        out = fn(*args, **kwargs)
+
+        out = tree_map(lambda t: rearrange(t, '1 ... -> ...') if is_tensor(t) else t, out)
+        return out
+
+    return inner
 
 # generalized advantage estimate
 
@@ -939,20 +953,13 @@ class EPO(Module):
 
                 while time < self.max_episode_length:
 
-                    batched_state = rearrange(state, '... -> 1 ...')
-
                     # sample action
 
-                    action, log_prob = self.agent.get_actor_actions(batched_state, latent = latent, sample = True, temperature = self.action_sample_temperature)
-
-                    action = rearrange(action, '1 ... -> ...')
-                    log_prob = rearrange(log_prob, '1 ... -> ...')
+                    action, log_prob = temp_batch_dim(self.agent.get_actor_actions)(state, latent = latent, sample = True, temperature = self.action_sample_temperature)
 
                     # values
 
-                    value = self.agent.get_critic_values(batched_state, latent = latent)
-
-                    value = rearrange(value, '1 ... -> ...')
+                    value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent)
 
                     # get the next state, action, and reward
 
@@ -981,10 +988,7 @@ class EPO(Module):
 
                 # need the final next value for GAE, iiuc
 
-                batched_state = rearrange(state, '... -> 1 ...')
-
-                next_value = self.agent.get_critic_values(batched_state, latent = latent)
-                next_value = rearrange(next_value, '1 ... -> ...')
+                next_value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent)
 
                 memory_for_gae = memory._replace(
                     episode_id = invalid_episode,
