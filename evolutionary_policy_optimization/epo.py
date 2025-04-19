@@ -628,6 +628,7 @@ class Agent(Module):
         latent_lr = 1e-5,
         use_critic_ema = True,
         critic_ema_beta = 0.99,
+        max_grad_norm = 0.5,
         batch_size = 16,
         calc_gae_kwargs: dict = dict(
             use_accelerated = False,
@@ -662,7 +663,11 @@ class Agent(Module):
         self.actor_loss = partial(actor_loss, **actor_loss_kwargs)
         self.calc_gae = partial(calc_generalized_advantage_estimate, **calc_gae_kwargs)
 
+        # learning hparams
+
         self.batch_size = batch_size
+        self.max_grad_norm = max_grad_norm
+        self.has_grad_clip = exists(max_grad_norm)
 
         # optimizers
 
@@ -821,6 +826,9 @@ class Agent(Module):
 
                 actor_loss.backward()
 
+                if exists(self.has_grad_clip):
+                    nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+
                 self.actor_optim.step()
                 self.actor_optim.zero_grad()
 
@@ -833,6 +841,9 @@ class Agent(Module):
                 )
 
                 critic_loss.backward()
+
+                if exists(self.has_grad_clip):
+                    nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
                 self.critic_optim.step()
                 self.critic_optim.zero_grad()
