@@ -87,6 +87,11 @@ def temp_batch_dim(fn):
 
     return inner
 
+# fitness related
+
+def get_fitness_scores(cum_rewards, memories):
+    return cum_rewards
+
 # generalized advantage estimate
 
 def calc_generalized_advantage_estimate(
@@ -643,6 +648,7 @@ class Agent(Module):
         actor_optim_kwargs: dict = dict(),
         critic_optim_kwargs: dict = dict(),
         latent_optim_kwargs: dict = dict(),
+        get_fitness_scores: Callable[..., Tensor] = get_fitness_scores
     ):
         super().__init__()
 
@@ -662,6 +668,10 @@ class Agent(Module):
 
         self.actor_loss = partial(actor_loss, **actor_loss_kwargs)
         self.calc_gae = partial(calc_generalized_advantage_estimate, **calc_gae_kwargs)
+
+        # fitness score related
+
+        self.get_fitness_scores = get_fitness_scores
 
         # learning hparams
 
@@ -766,10 +776,12 @@ class Agent(Module):
 
     def forward(
         self,
-        memories_and_fitness_scores: MemoriesAndFitnessScores,
+        memories_and_cumulative_rewards: MemoriesAndCumulativeRewards,
         epochs = 2
     ):
-        memories, fitness_scores = memories_and_fitness_scores
+        memories, cumulative_rewards = memories_and_cumulative_rewards
+
+        fitness_scores = self.get_fitness_scores(cumulative_rewards, memories)
 
         (
             episode_ids,
@@ -952,9 +964,9 @@ Memory = namedtuple('Memory', [
     'done'
 ])
 
-MemoriesAndFitnessScores = namedtuple('MemoriesAndFitnessScores', [
+MemoriesAndCumulativeRewards = namedtuple('MemoriesAndCumulativeRewards', [
     'memories',
-    'fitness_scores'
+    'cumulative_rewards'
 ])
 
 class EPO(Module):
@@ -978,7 +990,7 @@ class EPO(Module):
     def forward(
         self,
         env
-    ) -> MemoriesAndFitnessScores:
+    ) -> MemoriesAndCumulativeRewards:
 
         self.agent.eval()
 
@@ -986,7 +998,7 @@ class EPO(Module):
 
         memories: list[Memory] = []
 
-        fitness_scores = torch.zeros((self.num_latents))
+        cumulative_rewards = torch.zeros((self.num_latents))
 
         for episode_id in tqdm(range(self.episodes_per_latent), desc = 'episode'):
 
@@ -1019,9 +1031,9 @@ class EPO(Module):
 
                     state, reward, done = env(action)
 
-                    # update fitness for each gene as cumulative reward received, but make this customizable at some point
+                    # update cumulative rewards per latent, to be used as default fitness score
 
-                    fitness_scores[latent_id] += reward
+                    cumulative_rewards[latent_id] += reward
                     
                     # store memories
 
@@ -1051,7 +1063,7 @@ class EPO(Module):
 
                 memories.append(memory_for_gae)
 
-        return MemoriesAndFitnessScores(
+        return MemoriesAndCumulativeRewards(
             memories = memories,
-            fitness_scores = fitness_scores
+            cumulative_rewards = cumulative_rewards
         )
