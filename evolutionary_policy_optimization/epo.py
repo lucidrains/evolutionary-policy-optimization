@@ -875,25 +875,32 @@ def create_agent(
     actor_num_actions,
     actor_dim_hiddens: int | tuple[int, ...],
     critic_dim_hiddens: int | tuple[int, ...],
+    latent_gene_pool_kwargs: dict = dict(),
+    actor_kwargs: dict = dict(),
+    critic_kwargs: dict = dict(),
 ) -> Agent:
 
     latent_gene_pool = LatentGenePool(
         num_latents = num_latents,
-        dim_latent = dim_latent
+        dim_latent = dim_latent,
+        **latent_gene_pool_kwargs
     )
 
     actor = Actor(
         num_actions = actor_num_actions,
         dim_state = dim_state,
         dim_latent = dim_latent,
-        dim_hiddens = actor_dim_hiddens
+        dim_hiddens = actor_dim_hiddens,
+        **actor_kwargs
     )
 
     critic = Critic(
         dim_state = dim_state,
         dim_latent = dim_latent,
-        dim_hiddens = critic_dim_hiddens
-    )                
+        dim_hiddens = critic_dim_hiddens,
+        **critic_kwargs
+    )
+
     return Agent(actor = actor, critic = critic, latent_gene_pool = latent_gene_pool)
 
 # EPO - which is just PPO with natural selection of a population of latent variables conditioning the agent

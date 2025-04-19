@@ -7,7 +7,7 @@ from torch.nn import Module
 # functions
 
 def cast_tuple(v):
-    return v if isinstance(v, tuple) else v\
+    return v if isinstance(v, tuple) else (v,)
 
 # mock env
 

@@ -73,7 +73,10 @@ def test_create_agent(
     agent.save('./agent.pt', overwrite = True)
     agent.load('./agent.pt')
 
-def test_e2e_with_mock_env():
+@pytest.mark.parametrize('frozen_latents', (False, True))
+def test_e2e_with_mock_env(
+    frozen_latents
+):
     from evolutionary_policy_optimization import create_agent, EPO, Env
 
     agent = create_agent(
@@ -82,7 +85,10 @@ def test_e2e_with_mock_env():
         dim_latent = 32,
         actor_num_actions = 5,
         actor_dim_hiddens = (256, 128),
-        critic_dim_hiddens = (256, 128, 64)
+        critic_dim_hiddens = (256, 128, 64),
+        latent_gene_pool_kwargs = dict(
+            frozen_latents = frozen_latents
+        )
     )
 
     epo = EPO(
