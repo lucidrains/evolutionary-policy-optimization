@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import partial, wraps
 from pathlib import Path
 from collections import namedtuple
+from random import randrange
 
 import torch
 from torch import nn, cat, stack, is_tensor, tensor
@@ -989,7 +990,8 @@ class EPO(Module):
     @torch.no_grad()
     def forward(
         self,
-        env
+        env,
+        fix_seed_across_latents = True
     ) -> MemoriesAndCumulativeRewards:
 
         self.agent.eval()
@@ -1002,12 +1004,22 @@ class EPO(Module):
 
         for episode_id in tqdm(range(self.episodes_per_latent), desc = 'episode'):
 
+            # maybe fix seed for environment across all latents
+
+            env_reset_kwargs = dict()
+
+            if fix_seed_across_latents:
+                seed = randrange(int(1e6))
+                env_reset_kwargs = dict(seed = seed)
+
+            # for each latent (on a single machine for now)
+
             for latent_id in tqdm(range(self.num_latents), desc = 'latent'):
                 time = 0
 
                 # initial state
 
-                state = env.reset()
+                state = env.reset(**env_reset_kwargs)
 
                 # get latent from pool
 

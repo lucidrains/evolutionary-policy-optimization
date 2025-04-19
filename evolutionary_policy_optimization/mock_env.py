@@ -25,7 +25,8 @@ class Env(Module):
         return self.dummy.device
 
     def reset(
-        self
+        self,
+        seed
     ):
         state = randn(self.state_shape, device = self.device)
         return state
