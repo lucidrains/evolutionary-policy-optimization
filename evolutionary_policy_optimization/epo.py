@@ -626,6 +626,7 @@ class Agent(Module):
         actor_lr = 1e-4,
         critic_lr = 1e-4,
         latent_lr = 1e-5,
+        use_critic_ema = True,
         critic_ema_beta = 0.99,
         batch_size = 16,
         calc_gae_kwargs: dict = dict(
@@ -647,7 +648,9 @@ class Agent(Module):
         self.actor = actor
 
         self.critic = critic
-        self.critic_ema = EMA(critic, beta = critic_ema_beta, include_online_model = False, **ema_kwargs)
+
+        self.use_critic_ema = use_critic_ema
+        self.critic_ema = EMA(critic, beta = critic_ema_beta, include_online_model = False, **ema_kwargs) if use_critic_ema else None
 
         self.num_latents = latent_gene_pool.num_latents
         self.latent_gene_pool = latent_gene_pool
@@ -676,7 +679,7 @@ class Agent(Module):
         pkg = dict(
             actor = self.actor.state_dict(),
             critic = self.critic.state_dict(),
-            critic_ema = self.critic_ema.state_dict(),
+            critic_ema = self.critic_ema.state_dict() if self.use_critic_ema else None,
             latents = self.latent_gene_pool.state_dict(),
             actor_optim = self.actor_optim.state_dict(),
             critic_optim = self.critic_optim.state_dict(),
@@ -695,7 +698,9 @@ class Agent(Module):
         self.actor.load_state_dict(pkg['actor'])
 
         self.critic.load_state_dict(pkg['critic'])
-        self.critic_ema.load_state_dict(pkg['critic_ema'])
+
+        if self.use_critic_ema:
+            self.critic_ema.load_state_dict(pkg['critic_ema'])
 
         self.latent_gene_pool.load_state_dict(pkg['latents'])
 
@@ -733,14 +738,20 @@ class Agent(Module):
         self,
         state,
         latent_id = None,
-        latent = None
+        latent = None,
+        use_ema_if_available = False
     ):
         assert exists(latent_id) or exists(latent)
 
         if not exists(latent):
             latent = self.latent_gene_pool(latent_id = latent_id)
 
-        return self.critic(state, latent)
+        critic_forward = self.critic
+
+        if use_ema_if_available and self.use_critic_ema:
+            critic_forward = self.critic_ema
+
+        return critic_forward(state, latent)
 
     def update_latent_gene_pool_(
         self,
@@ -826,6 +837,11 @@ class Agent(Module):
                 self.critic_optim.step()
                 self.critic_optim.zero_grad()
 
+                # maybe ema update critic
+
+                if self.use_critic_ema:
+                    self.critic_ema.update()
+
                 # maybe update latents, if not frozen
 
                 if not self.latent_gene_pool.frozen_latents:
@@ -875,6 +891,7 @@ def create_agent(
     actor_num_actions,
     actor_dim_hiddens: int | tuple[int, ...],
     critic_dim_hiddens: int | tuple[int, ...],
+    use_critic_ema = True,
     latent_gene_pool_kwargs: dict = dict(),
     actor_kwargs: dict = dict(),
     critic_kwargs: dict = dict(),
@@ -901,7 +918,14 @@ def create_agent(
         **critic_kwargs
     )
 
-    return Agent(actor = actor, critic = critic, latent_gene_pool = latent_gene_pool)
+    agent = Agent(
+        actor = actor,
+        critic = critic,
+        latent_gene_pool = latent_gene_pool,
+        use_critic_ema = use_critic_ema
+    )
+
+    return agent
 
 # EPO - which is just PPO with natural selection of a population of latent variables conditioning the agent
 # the tricky part is that the latent ids for each episode / trajectory needs to be tracked
@@ -978,7 +1002,7 @@ class EPO(Module):
 
                     # values
 
-                    value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent)
+                    value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent, use_ema_if_available = True)
 
                     # get the next state, action, and reward
 

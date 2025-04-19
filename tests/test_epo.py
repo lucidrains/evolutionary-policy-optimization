@@ -74,8 +74,10 @@ def test_create_agent(
     agent.load('./agent.pt')
 
 @pytest.mark.parametrize('frozen_latents', (False, True))
+@pytest.mark.parametrize('use_critic_ema', (False, True))
 def test_e2e_with_mock_env(
-    frozen_latents
+    frozen_latents,
+    use_critic_ema
 ):
     from evolutionary_policy_optimization import create_agent, EPO, Env
 
@@ -86,8 +88,9 @@ def test_e2e_with_mock_env(
         actor_num_actions = 5,
         actor_dim_hiddens = (256, 128),
         critic_dim_hiddens = (256, 128, 64),
+        use_critic_ema = use_critic_ema,
         latent_gene_pool_kwargs = dict(
-            frozen_latents = frozen_latents
+            frozen_latents = frozen_latents,
         )
     )
 
