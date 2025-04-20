@@ -357,9 +357,10 @@ class LatentGenePool(Module):
         frac_natural_selected = 0.25,    # number of least fit genes to remove from the pool
         frac_elitism = 0.1,              # frac of population to preserve from being noised
         frac_migrate = 0.1,              # frac of population, excluding elites, that migrate between islands randomly. will use a designated set migration pattern (since for some reason using random it seems to be worse for me)
+        migrate_every = 100,             # how many steps before a migration between islands
         mutation_strength = 1.,          # factor to multiply to gaussian noise as mutation to latents
         should_run_genetic_algorithm: Module | None = None, # eq (3) in paper
-        default_should_run_ga_gamma = 1.5
+        default_should_run_ga_gamma = 1.5,
     ):
         super().__init__()
 
@@ -408,6 +409,13 @@ class LatentGenePool(Module):
             should_run_genetic_algorithm = ShouldRunGeneticAlgorithm(gamma = default_should_run_ga_gamma)
 
         self.should_run_genetic_algorithm = should_run_genetic_algorithm
+
+        self.can_migrate = num_islands > 1
+        self.migrate_every = migrate_every
+        self.register_buffer('step', tensor(0))
+
+    def advance_step_(self):
+        self.step.add_(1)
 
     def firefly_step(
         self,
@@ -460,7 +468,7 @@ class LatentGenePool(Module):
         self,
         fitness, # Float['p'],
         inplace = True,
-        migrate = False # trigger a migration in the setting of multiple islands, the loop outside will need to have some `migrate_every` hyperparameter
+        migrate = None # trigger a migration in the setting of multiple islands, the loop outside will need to have some `migrate_every` hyperparameter
     ):
         device = self.latents.device
 
@@ -547,8 +555,9 @@ class LatentGenePool(Module):
 
         # 6. maybe migration
 
+        migrate = self.can_migrate and default(migrate, divisible_by(self.step.item(), self.migrate_every))
+
         if migrate:
-            assert self.num_islands > 1
             randperm = torch.randn(genes.shape[:-1], device = device).argsort(dim = -1)
 
             migrate_mask = randperm < self.num_migrate
@@ -580,6 +589,8 @@ class LatentGenePool(Module):
         # store the genes for the next interaction with environment for new fitness values (a function of reward and other to be researched measures)
 
         self.latents.copy_(genes)
+
+        self.advance_step_()
 
     def forward(
         self,
