@@ -6,7 +6,7 @@ from collections import namedtuple
 from random import randrange
 
 import torch
-from torch import nn, cat, stack, is_tensor, tensor
+from torch import nn, cat, stack, is_tensor, tensor, Tensor
 import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleList
 from torch.utils.data import TensorDataset, DataLoader
@@ -412,7 +412,16 @@ class LatentGenePool(Module):
 
         self.can_migrate = num_islands > 1
         self.migrate_every = migrate_every
-        self.register_buffer('step', tensor(0))
+        self.register_buffer('step', tensor(1))
+
+    def get_distance(self):
+        # returns latent euclidean distance as proxy for diversity
+
+        latents = rearrange(self.latents, '(i p) g -> i p g', i = self.num_islands)
+
+        distance = torch.cdist(latents, latents)
+
+        return distance
 
     def advance_step_(self):
         self.step.add_(1)
@@ -643,6 +652,7 @@ class Agent(Module):
         actor_lr = 1e-4,
         critic_lr = 1e-4,
         latent_lr = 1e-5,
+        diversity_aux_loss_weight = 0.,
         use_critic_ema = True,
         critic_ema_beta = 0.99,
         max_grad_norm = 0.5,
@@ -697,6 +707,11 @@ class Agent(Module):
         self.critic_optim = optim_klass(critic.parameters(), lr = critic_lr, **critic_optim_kwargs)
 
         self.latent_optim = optim_klass(latent_gene_pool.parameters(), lr = latent_lr, **latent_optim_kwargs) if not latent_gene_pool.frozen_latents else None
+
+        # promotes latents to be farther apart for diversity maintenance
+
+        self.has_diversity_loss = diversity_aux_loss_weight > 0.
+        self.diversity_aux_loss_weight = diversity_aux_loss_weight
 
     def save(self, path, overwrite = False):
         path = Path(path)
@@ -879,11 +894,19 @@ class Agent(Module):
 
                 # maybe update latents, if not frozen
 
-                if not self.latent_gene_pool.frozen_latents:
-                    orig_latents.backward(latents.grad)
+                if self.latent_gene_pool.frozen_latents:
+                    continue
 
-                    self.latent_optim.step()
-                    self.latent_optim.zero_grad()
+                orig_latents.backward(latents.grad)
+
+                if self.has_diversity_loss:
+                    diversity = self.latent_gene_pool.get_distance()
+                    diversity_loss = diversity.mul(-1).exp().mean()
+
+                    (diversity_loss * self.diversity_aux_loss_weight).backward()
+
+                self.latent_optim.step()
+                self.latent_optim.zero_grad()
 
         # apply evolution
 
@@ -930,6 +953,7 @@ def create_agent(
     latent_gene_pool_kwargs: dict = dict(),
     actor_kwargs: dict = dict(),
     critic_kwargs: dict = dict(),
+    **kwargs
 ) -> Agent:
 
     latent_gene_pool = LatentGenePool(
@@ -957,7 +981,8 @@ def create_agent(
         actor = actor,
         critic = critic,
         latent_gene_pool = latent_gene_pool,
-        use_critic_ema = use_critic_ema
+        use_critic_ema = use_critic_ema,
+        **kwargs
     )
 
     return agent
