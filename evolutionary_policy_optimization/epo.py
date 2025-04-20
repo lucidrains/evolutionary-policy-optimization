@@ -48,6 +48,9 @@ def divisible_by(num, den):
 def l2norm(t):
     return F.normalize(t, p = 2, dim = -1)
 
+def batch_randperm(shape, device):
+    return torch.randn(shape, device = device).argsort(dim = -1)
+
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
 
@@ -393,7 +396,6 @@ class LatentGenePool(Module):
 
         latents_per_island = num_latents // num_islands
         self.num_natural_selected = int(frac_natural_selected * latents_per_island)
-
         self.num_tournament_participants = int(frac_tournaments * self.num_natural_selected)
 
         self.crossover_random  = crossover_random
@@ -530,7 +532,9 @@ class LatentGenePool(Module):
 
         # 2. for finding pairs of parents to replete gene pool, we will go with the popular tournament strategy
 
-        rand_tournament_gene_ids = torch.randn((islands, pop_size_per_island - self.num_natural_selected, tournament_participants), device = device).argsort(dim = -1)
+        tournament_shape = (islands, pop_size_per_island - self.num_natural_selected, self.num_natural_selected) # (island, num children needed, natural selected population to be bred)
+
+        rand_tournament_gene_ids = batch_randperm(tournament_shape, device)[..., :tournament_participants]
         rand_tournament_gene_ids_for_gather = rearrange(rand_tournament_gene_ids, 'i p t -> i (p t)')
 
         participant_fitness = fitness.gather(1, rand_tournament_gene_ids_for_gather)
