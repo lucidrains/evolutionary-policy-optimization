@@ -25,6 +25,12 @@ def pad_dim_to(t, length, dim = 0):
 def is_distributed():
     return dist.is_initialized() and dist.get_world_size() > 1
 
+def get_world_and_rank():
+    if not is_distributed():
+        return 1, 0
+
+    return dist.get_world_size(), dist.get_rank()
+
 def maybe_sync_seed(device, max_size = int(1e6)):
     rand_int = torch.randint(0, max_size, (), device = device)
 

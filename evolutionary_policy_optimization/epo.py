@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from functools import partial, wraps
 from pathlib import Path
+from math import ceil
+from functools import partial, wraps
 from collections import namedtuple
 from random import randrange
 
@@ -19,6 +20,7 @@ from einops.layers.torch import Rearrange
 
 from evolutionary_policy_optimization.distributed import (
     is_distributed,
+    get_world_and_rank,
     maybe_sync_seed,
     all_gather_variable_dim,
     maybe_barrier
@@ -1061,22 +1063,20 @@ class EPO(Module):
     def latents_for_machine(self):
         num_latents = self.num_latents
 
-        if not is_distributed():
-            return list(range(self.num_latents))
+        world_size, rank = get_world_and_rank()
 
-        world_size, rank = dist.get_world_size(), dist.get_rank()
         assert num_latents >= world_size, 'number of latents must be greater than world size for now'
         assert rank < world_size
 
-        pad_id = -1
-        num_latents_rounded_up = ceil(num_latents / world_size) * world_size
-        latent_ids = torch.arange(num_latents_rounded_up)
-        latent_ids[latent_ids >= num_latents] = pad_id
+        num_latents_per_machine = ceil(num_latents / world_size)
 
-        latent_ids = rearrange(latent_ids, '(world latents) -> world latents', world = world_size)
-        out = latent_ids[rank]
+        for i in range(num_latents_per_machine):
+            latent_id = rank * num_latents_per_machine + i
 
-        return out[out != pad_id].tolist()
+            if latent_id >= num_latents:
+                continue
+
+            yield i
 
     @torch.no_grad()
     def forward(
@@ -1093,7 +1093,7 @@ class EPO(Module):
 
         cumulative_rewards = torch.zeros((self.num_latents))
 
-        latent_ids = self.latents_for_machine()
+        latent_ids_gen = self.latents_for_machine()
 
         for episode_id in tqdm(range(self.episodes_per_latent), desc = 'episode'):
 
@@ -1109,7 +1109,7 @@ class EPO(Module):
 
             # for each latent (on a single machine for now)
 
-            for latent_id in tqdm(latent_ids, desc = 'latent'):
+            for latent_id in tqdm(latent_ids_gen, desc = 'latent'):
                 time = 0
 
                 # initial state
