@@ -39,9 +39,34 @@ def crossover_weights(w1, w2, transpose = False):
 
     return out
 
+def mutate_weight(
+    w,
+    transpose = False,
+    mutation_strength = 1.
+):
+
+    if transpose:
+        w = w.transpose(-1, -2)
+
+    rank = min(w2.shape[1:])
+    assert rank >= 2
+
+    u, s, v = torch.svd(w)
+    u = u + torch.randn_like(u) * mutation_strength
+    v = v + torch.randn_like(v) * mutation_strength
+
+    out = u @ torch.diag_embed(s) @ v.mT
+
+    if transpose:
+        out = out.transpose(-1, -2)
+
+    return out
+
 if __name__ == '__main__':
     w1 = torch.randn(32, 16)
     w2 = torch.randn(32, 16)
-    child = crossover_weights(w2, w2)
+
+    child = crossover_weights(w1, w2)
+    mutated_w1 = mutate_weight(w1)
 
     assert child.shape == w2.shape
