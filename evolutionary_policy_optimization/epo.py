@@ -8,13 +8,21 @@ from random import randrange
 import torch
 from torch import nn, cat, stack, is_tensor, tensor, Tensor
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.nn import Linear, Module, ModuleList
 from torch.utils.data import TensorDataset, DataLoader
-from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
+from torch.utils._pytree import tree_map
 
 import einx
 from einops import rearrange, repeat, einsum, pack
 from einops.layers.torch import Rearrange
+
+from evolutionary_policy_optimization.distributed import (
+    is_distributed,
+    maybe_sync_seed,
+    all_gather_variable_dim,
+    maybe_barrier
+)
 
 from assoc_scan import AssocScan
 
@@ -822,6 +830,15 @@ class Agent(Module):
 
         fitness_scores = self.get_fitness_scores(cumulative_rewards, memories)
 
+        # stack memories
+
+        memories = map(stack, zip(*memories))
+
+        maybe_barrier()
+
+        if is_distributed():
+            memories = map(partial(all_gather_variable_dim, dim = 0), memories)
+
         (
             episode_ids,
             states,
@@ -831,7 +848,7 @@ class Agent(Module):
             rewards,
             values,
             dones
-        ) = map(stack, zip(*memories))
+        ) = memories
 
         advantages = self.calc_gae(
             rewards[:-1],
@@ -1035,6 +1052,32 @@ class EPO(Module):
         self.episodes_per_latent = episodes_per_latent
         self.max_episode_length = max_episode_length
 
+        self.register_buffer('dummy', tensor(0))
+
+    @property
+    def device(self):
+        return self.dummy.device
+
+    def latents_for_machine(self):
+        num_latents = self.num_latents
+
+        if not is_distributed():
+            return list(range(self.num_latents))
+
+        world_size, rank = dist.get_world_size(), dist.get_rank()
+        assert num_latents >= world_size, 'number of latents must be greater than world size for now'
+        assert rank < world_size
+
+        pad_id = -1
+        num_latents_rounded_up = ceil(num_latents / world_size) * world_size
+        latent_ids = torch.arange(num_latents_rounded_up)
+        latent_ids[latent_ids >= num_latents] = pad_id
+
+        latent_ids = rearrange(latent_ids, '(world latents) -> world latents', world = world_size)
+        out = latent_ids[rank]
+
+        return out[out != pad_id].tolist()
+
     @torch.no_grad()
     def forward(
         self,
@@ -1050,19 +1093,23 @@ class EPO(Module):
 
         cumulative_rewards = torch.zeros((self.num_latents))
 
+        latent_ids = self.latents_for_machine()
+
         for episode_id in tqdm(range(self.episodes_per_latent), desc = 'episode'):
+
+            maybe_barrier()
 
             # maybe fix seed for environment across all latents
 
             env_reset_kwargs = dict()
 
             if fix_seed_across_latents:
-                seed = randrange(int(1e6))
+                seed = maybe_sync_seed(device = self.device)
                 env_reset_kwargs = dict(seed = seed)
 
             # for each latent (on a single machine for now)
 
-            for latent_id in tqdm(range(self.num_latents), desc = 'latent'):
+            for latent_id in tqdm(latent_ids, desc = 'latent'):
                 time = 0
 
                 # initial state
