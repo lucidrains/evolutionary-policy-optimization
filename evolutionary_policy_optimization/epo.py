@@ -360,10 +360,11 @@ class LatentGenePool(Module):
         frac_natural_selected = 0.25,    # number of least fit genes to remove from the pool
         frac_elitism = 0.1,              # frac of population to preserve from being noised
         frac_migrate = 0.1,              # frac of population, excluding elites, that migrate between islands randomly. will use a designated set migration pattern (since for some reason using random it seems to be worse for me)
-        migrate_every = 100,             # how many steps before a migration between islands
         mutation_strength = 1.,          # factor to multiply to gaussian noise as mutation to latents
         should_run_genetic_algorithm: Module | None = None, # eq (3) in paper
         default_should_run_ga_gamma = 1.5,
+        migrate_every = 100,                 # how many steps before a migration between islands
+        apply_genetic_algorithm_every = 2    # how many steps before crossover + mutation happens for genes
     ):
         super().__init__()
 
@@ -413,7 +414,10 @@ class LatentGenePool(Module):
         self.should_run_genetic_algorithm = should_run_genetic_algorithm
 
         self.can_migrate = num_islands > 1
+
         self.migrate_every = migrate_every
+        self.apply_genetic_algorithm_every = apply_genetic_algorithm_every
+
         self.register_buffer('step', tensor(1))
 
     def get_distance(self):
@@ -482,6 +486,10 @@ class LatentGenePool(Module):
         migrate = None # trigger a migration in the setting of multiple islands, the loop outside will need to have some `migrate_every` hyperparameter
     ):
         device = self.latents.device
+
+        if not divisible_by(self.step.item(), self.apply_genetic_algorithm_every):
+            self.advance_step_()
+            return
 
         """
         i - islands
