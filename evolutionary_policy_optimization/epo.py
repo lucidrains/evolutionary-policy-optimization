@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Callable
 
 from pathlib import Path
 from math import ceil
@@ -374,13 +375,16 @@ class LatentGenePool(Module):
         should_run_genetic_algorithm: Module | None = None, # eq (3) in paper
         default_should_run_ga_gamma = 1.5,
         migrate_every = 100,                 # how many steps before a migration between islands
-        apply_genetic_algorithm_every = 2    # how many steps before crossover + mutation happens for genes
+        apply_genetic_algorithm_every = 2,   # how many steps before crossover + mutation happens for genes
+        init_latent_fn: Callable | None = None
     ):
         super().__init__()
 
         maybe_l2norm = l2norm if l2norm_latent else identity
 
-        latents = torch.randn(num_latents, dim_latent)
+        init_fn = default(init_latent_fn, torch.randn)
+
+        latents = init_fn((num_latents, dim_latent))
 
         if l2norm_latent:
             latents = maybe_l2norm(latents, dim = -1)
