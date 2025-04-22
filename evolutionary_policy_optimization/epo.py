@@ -952,7 +952,10 @@ def actor_loss(
     advantages,     # Float[b]
     eps_clip = 0.2,
     entropy_weight = .01,
+    eps = 1e-5
 ):
+    batch = logits.shape[0]
+
     log_probs = gather_log_prob(logits, actions)
 
     ratio = (log_probs - old_log_probs).exp()
@@ -960,6 +963,8 @@ def actor_loss(
     # classic clipped surrogate loss from ppo
 
     clipped_ratio = ratio.clamp(min = 1. - eps_clip, max = 1. + eps_clip)
+
+    advantages = F.layer_norm(advantages, (batch,), eps = eps)
 
     actor_loss = -torch.min(clipped_ratio * advantages, ratio * advantages)
 
