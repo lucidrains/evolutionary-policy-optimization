@@ -1,6 +1,6 @@
 [project]
 name = "evolutionary-policy-optimization"
-version = "0.0.58"
+version = "0.0.59"
 description = "EPO - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -15,7 +15,7 @@ keywords = [
     'genetic algorithms',
     'robotics'
   ]
-classifiers=[
+classifiers = [
     'Development Status :: 4 - Beta',
     'Intended Audience :: Developers',
     'Topic :: Scientific/Engineering :: Artificial Intelligence',
@@ -25,7 +25,7 @@ classifiers=[
 
 dependencies = [
     "adam-atan2-pytorch",
-    'assoc-scan',
+    'assoc-scan>=0.0.2',
     'einx>=0.3.0',
     'einops>=0.8.1',
     'ema-pytorch>=0.7.7',
