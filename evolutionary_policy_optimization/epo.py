@@ -839,6 +839,8 @@ class Agent(Module):
         if is_distributed():
             memories = map(partial(all_gather_variable_dim, dim = 0), memories)
 
+            fitness_scores = all_gather_variable_dim(fitness_scores, dim = 0)
+
         (
             episode_ids,
             states,
