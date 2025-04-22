@@ -856,10 +856,12 @@ class Agent(Module):
             dones
         ) = memories
 
+        masks = 1. - dones.float()
+
         advantages = self.calc_gae(
             rewards[:-1],
             values,
-            dones[:-1],
+            masks[:-1],
         )
 
         valid_episode = episode_ids >= 0
