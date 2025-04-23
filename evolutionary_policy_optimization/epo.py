@@ -684,7 +684,8 @@ class Agent(Module):
         ),
         actor_loss_kwargs: dict = dict(
             eps_clip = 0.2,
-            entropy_weight = .01
+            entropy_weight = .01,
+            norm_advantages = True
         ),
         ema_kwargs: dict = dict(),
         actor_optim_kwargs: dict = dict(),
@@ -954,7 +955,8 @@ def actor_loss(
     advantages,     # Float[b]
     eps_clip = 0.2,
     entropy_weight = .01,
-    eps = 1e-5
+    eps = 1e-5,
+    norm_advantages = True
 ):
     batch = logits.shape[0]
 
@@ -966,7 +968,8 @@ def actor_loss(
 
     clipped_ratio = ratio.clamp(min = 1. - eps_clip, max = 1. + eps_clip)
 
-    advantages = F.layer_norm(advantages, (batch,), eps = eps)
+    if norm_advantages:
+        advantages = F.layer_norm(advantages, (batch,), eps = eps)
 
     actor_loss = -torch.min(clipped_ratio * advantages, ratio * advantages)
 
