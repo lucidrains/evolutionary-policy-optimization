@@ -3,6 +3,7 @@ from typing import Callable
 
 from pathlib import Path
 from math import ceil
+from itertools import product
 from functools import partial, wraps
 from collections import namedtuple
 from random import randrange
@@ -1083,29 +1084,56 @@ class EPO(Module):
     def device(self):
         return self.dummy.device
 
-    def latents_for_machine(self):
+    def rollouts_for_machine(
+        self,
+        fix_environ_across_latents = False
+    ): # -> (<latent_id>, <episode_id>, <maybe synced env seed>) for the machine
+
         num_latents = self.num_latents
+        episodes = self.episodes_per_latent
+        num_latent_episodes = num_latents * episodes
+
+        # if fixing environment across latents, compute all the environment seeds upfront for simplicity
+
+        environment_seeds = None
+
+        if fix_environ_across_latents:
+            environment_seeds = torch.randint(0, int(1e6), (episodes,))
+
+            if is_distributed():
+                dist.all_reduce(environment_seeds) # reduce sum as a way to synchronize. it's fine
+
+        # get number of machines, and this machine id
 
         world_size, rank = get_world_and_rank()
 
-        assert num_latents >= world_size, 'number of latents must be greater than world size for now'
-        assert rank < world_size
+        assert num_latent_episodes >= world_size, f'number of ({self.num_latents} latents x {self.episodes_per_latent} episodes) ({num_latent_episodes}) must be greater than world size ({world_size}) for now'
 
-        num_latents_per_machine = ceil(num_latents / world_size)
+        latent_episode_permutations = list(product(range(num_latents), range(episodes)))
 
-        for i in range(num_latents_per_machine):
-            latent_id = rank * num_latents_per_machine + i
+        num_rollouts_per_machine = ceil(num_latent_episodes / world_size)
 
-            if latent_id >= num_latents:
+        for i in range(num_rollouts_per_machine):
+            rollout_id = rank * num_rollouts_per_machine + i
+
+            if rollout_id >= num_latent_episodes:
                 continue
 
-            yield i
+            latent_id, episode_id = latent_episode_permutations[rollout_id]
+
+            # maybe synchronized environment seed
+
+            maybe_seed = None
+            if fix_environ_across_latents:
+                maybe_seed = environment_seeds[episode_id]
+
+            yield latent_id, episode_id, maybe_seed
 
     @torch.no_grad()
     def forward(
         self,
         env,
-        fix_seed_across_latents = True
+        fix_environ_across_latents = True
     ) -> MemoriesAndCumulativeRewards:
 
         self.agent.eval()
@@ -1116,82 +1144,74 @@ class EPO(Module):
 
         rewards_per_latent_episode = torch.zeros((self.num_latents, self.episodes_per_latent))
 
-        latent_ids_gen = self.latents_for_machine()
+        rollout_gen = self.rollouts_for_machine(fix_environ_across_latents)
 
-        for episode_id in tqdm(range(self.episodes_per_latent), desc = 'episode'):
+        for latent_id, episode_id, maybe_seed in tqdm(rollout_gen, desc = 'rollout'):
 
-            maybe_barrier()
+            time = 0
 
-            # maybe fix seed for environment across all latents
+            # initial state
 
-            env_reset_kwargs = dict()
+            reset_kwargs = dict()
 
-            if fix_seed_across_latents:
-                seed = maybe_sync_seed(device = self.device)
-                env_reset_kwargs = dict(seed = seed)
+            if fix_environ_across_latents:
+                reset_kwargs.update(seed = maybe_seed)
 
-            # for each latent (on a single machine for now)
+            state = env.reset(**reset_kwargs)
 
-            for latent_id in tqdm(latent_ids_gen, desc = 'latent'):
-                time = 0
+            # get latent from pool
 
-                # initial state
+            latent = self.agent.latent_gene_pool(latent_id = latent_id)
 
-                state = env.reset(**env_reset_kwargs)
+            # until maximum episode length
 
-                # get latent from pool
+            done = tensor(False)
 
-                latent = self.agent.latent_gene_pool(latent_id = latent_id)
+            while time < self.max_episode_length and not done:
 
-                # until maximum episode length
+                # sample action
 
-                done = tensor(False)
+                action, log_prob = temp_batch_dim(self.agent.get_actor_actions)(state, latent = latent, sample = True, temperature = self.action_sample_temperature)
 
-                while time < self.max_episode_length and not done:
+                # values
 
-                    # sample action
+                value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent, use_ema_if_available = True)
 
-                    action, log_prob = temp_batch_dim(self.agent.get_actor_actions)(state, latent = latent, sample = True, temperature = self.action_sample_temperature)
+                # get the next state, action, and reward
 
-                    # values
+                state, reward, done = env(action)
 
-                    value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent, use_ema_if_available = True)
+                # update cumulative rewards per latent, to be used as default fitness score
 
-                    # get the next state, action, and reward
+                rewards_per_latent_episode[latent_id, episode_id] += reward
+                
+                # store memories
 
-                    state, reward, done = env(action)
-
-                    # update cumulative rewards per latent, to be used as default fitness score
-
-                    rewards_per_latent_episode[latent_id, episode_id] += reward
-                    
-                    # store memories
-
-                    memory = Memory(
-                        tensor(episode_id),
-                        state,
-                        tensor(latent_id),
-                        action,
-                        log_prob,
-                        reward,
-                        value,
-                        done
-                    )
-
-                    memories.append(memory)
-
-                    time += 1
-
-                # need the final next value for GAE, iiuc
-
-                next_value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent)
-
-                memory_for_gae = memory._replace(
-                    episode_id = invalid_episode,
-                    value = next_value
+                memory = Memory(
+                    tensor(episode_id),
+                    state,
+                    tensor(latent_id),
+                    action,
+                    log_prob,
+                    reward,
+                    value,
+                    done
                 )
 
-                memories.append(memory_for_gae)
+                memories.append(memory)
+
+                time += 1
+
+            # need the final next value for GAE, iiuc
+
+            next_value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent)
+
+            memory_for_gae = memory._replace(
+                episode_id = invalid_episode,
+                value = next_value
+            )
+
+            memories.append(memory_for_gae)
 
         return MemoriesAndCumulativeRewards(
             memories = memories,
