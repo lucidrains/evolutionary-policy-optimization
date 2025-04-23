@@ -104,8 +104,11 @@ def temp_batch_dim(fn):
 
 # fitness related
 
-def get_fitness_scores(cum_rewards, memories):
-    return cum_rewards
+def get_fitness_scores(
+    cum_rewards, # Float['gene episodes']
+    memories
+): # Float['gene']
+    return cum_rewards.sum(dim = -1) # sum all rewards across episodes, but could override this function for normalizing with whatever
 
 # generalized advantage estimate
 
@@ -827,9 +830,7 @@ class Agent(Module):
         memories_and_cumulative_rewards: MemoriesAndCumulativeRewards,
         epochs = 2
     ):
-        memories, cumulative_rewards = memories_and_cumulative_rewards
-
-        fitness_scores = self.get_fitness_scores(cumulative_rewards, memories)
+        memories, rewards_per_latent_episode = memories_and_cumulative_rewards
 
         # stack memories
 
@@ -840,7 +841,13 @@ class Agent(Module):
         if is_distributed():
             memories = map(partial(all_gather_variable_dim, dim = 0), memories)
 
-            fitness_scores = all_gather_variable_dim(fitness_scores, dim = 0)
+            rewards_per_latent_episode = dist.all_reduce(rewards_per_latent_episode)
+
+        # calculate fitness scores
+
+        fitness_scores = self.get_fitness_scores(rewards_per_latent_episode, memories)
+
+        # process memories
 
         (
             episode_ids,
@@ -855,11 +862,15 @@ class Agent(Module):
 
         masks = 1. - dones.float()
 
+        # generalized advantage estimate
+
         advantages = self.calc_gae(
             rewards[:-1],
             values,
             masks[:-1],
         )
+
+        # dataset and dataloader
 
         valid_episode = episode_ids >= 0
 
@@ -871,6 +882,8 @@ class Agent(Module):
         )
 
         dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
+
+        # updating actor and critic
 
         self.actor.train()
         self.critic.train()
@@ -1044,7 +1057,7 @@ Memory = namedtuple('Memory', [
 
 MemoriesAndCumulativeRewards = namedtuple('MemoriesAndCumulativeRewards', [
     'memories',
-    'cumulative_rewards'
+    'cumulative_rewards' # Float['latent episodes']
 ])
 
 class EPO(Module):
@@ -1101,7 +1114,7 @@ class EPO(Module):
 
         memories: list[Memory] = []
 
-        cumulative_rewards = torch.zeros((self.num_latents))
+        rewards_per_latent_episode = torch.zeros((self.num_latents, self.episodes_per_latent))
 
         latent_ids_gen = self.latents_for_machine()
 
@@ -1150,7 +1163,7 @@ class EPO(Module):
 
                     # update cumulative rewards per latent, to be used as default fitness score
 
-                    cumulative_rewards[latent_id] += reward
+                    rewards_per_latent_episode[latent_id, episode_id] += reward
                     
                     # store memories
 
@@ -1182,5 +1195,5 @@ class EPO(Module):
 
         return MemoriesAndCumulativeRewards(
             memories = memories,
-            cumulative_rewards = cumulative_rewards
+            cumulative_rewards = rewards_per_latent_episode
         )
