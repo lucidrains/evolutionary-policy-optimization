@@ -1068,7 +1068,8 @@ class EPO(Module):
         agent: Agent,
         episodes_per_latent,
         max_episode_length,
-        action_sample_temperature = 1.
+        action_sample_temperature = 1.,
+        fix_environ_across_latents = True
     ):
         super().__init__()
         self.agent = agent
@@ -1077,6 +1078,7 @@ class EPO(Module):
         self.num_latents = agent.latent_gene_pool.num_latents
         self.episodes_per_latent = episodes_per_latent
         self.max_episode_length = max_episode_length
+        self.fix_environ_across_latents = fix_environ_across_latents
 
         self.register_buffer('dummy', tensor(0))
 
@@ -1133,8 +1135,10 @@ class EPO(Module):
     def forward(
         self,
         env,
-        fix_environ_across_latents = True
+        fix_environ_across_latents = None
     ) -> MemoriesAndCumulativeRewards:
+
+        fix_environ_across_latents = default(fix_environ_across_latents, self.fix_environ_across_latents)
 
         self.agent.eval()
 
@@ -1202,16 +1206,18 @@ class EPO(Module):
 
                 time += 1
 
-            # need the final next value for GAE, iiuc
+            if not done:
+                # add bootstrap value if truncated
 
-            next_value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent)
+                next_value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent)
 
-            memory_for_gae = memory._replace(
-                episode_id = invalid_episode,
-                value = next_value
-            )
+                memory_for_gae = memory._replace(
+                    episode_id = invalid_episode,
+                    value = next_value,
+                    done = tensor(True)
+                )
 
-            memories.append(memory_for_gae)
+                memories.append(memory_for_gae)
 
         return MemoriesAndCumulativeRewards(
             memories = memories,
