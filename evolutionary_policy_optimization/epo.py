@@ -114,18 +114,17 @@ def get_fitness_scores(
 # generalized advantage estimate
 
 def calc_generalized_advantage_estimate(
-    rewards, # Float[n]
-    values,  # Float[n+1]
-    masks,   # Bool[n]
+    rewards,
+    values,
+    masks,
     gamma = 0.99,
     lam = 0.95,
     use_accelerated = None
 ):
-    assert values.shape[-1] == (rewards.shape[-1] + 1)
-
     use_accelerated = default(use_accelerated, rewards.is_cuda)
     device = rewards.device
 
+    values = F.pad(values, (0, 1), value = 0.)
     values, values_next = values[:-1], values[1:]
 
     delta = rewards + gamma * values_next * masks - values
@@ -866,21 +865,16 @@ class Agent(Module):
         # generalized advantage estimate
 
         advantages = self.calc_gae(
-            rewards[:-1],
+            rewards,
             values,
-            masks[:-1],
+            masks,
         )
 
         # dataset and dataloader
 
         valid_episode = episode_ids >= 0
 
-        dataset = TensorDataset(
-            *[   
-                advantages[valid_episode[:-1]],
-                *[t[valid_episode] for t in (states, latent_gene_ids, actions, log_probs, values)]
-            ]
-        )
+        dataset = TensorDataset(*[t[valid_episode] for t in (advantages, states, latent_gene_ids, actions, log_probs, values)])
 
         dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
 
@@ -1183,12 +1177,14 @@ class EPO(Module):
 
                 # get the next state, action, and reward
 
-                state, reward, done = env(action)
+                state, reward, truncated, terminated = env(action)
+
+                done = truncated or terminated
 
                 # update cumulative rewards per latent, to be used as default fitness score
 
                 rewards_per_latent_episode[latent_id, episode_id] += reward
-                
+
                 # store memories
 
                 memory = Memory(
@@ -1199,14 +1195,14 @@ class EPO(Module):
                     log_prob,
                     reward,
                     value,
-                    done
+                    terminated
                 )
 
                 memories.append(memory)
 
                 time += 1
 
-            if not done:
+            if not terminated:
                 # add bootstrap value if truncated
 
                 next_value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent)

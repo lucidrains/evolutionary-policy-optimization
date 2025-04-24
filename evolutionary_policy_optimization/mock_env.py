@@ -1,4 +1,5 @@
 from __future__ import annotations
+from random import choice
 
 import torch
 from torch import tensor, randn, randint
@@ -14,21 +15,25 @@ def cast_tuple(v):
 class Env(Module):
     def __init__(
         self,
-        state_shape: int | tuple[int, ...]
+        state_shape: int | tuple[int, ...],
+        can_terminate_after = 2
     ):
         super().__init__()
         self.state_shape = cast_tuple(state_shape)
-        self.register_buffer('dummy', tensor(0))
+
+        self.can_terminate_after = can_terminate_after
+        self.register_buffer('step', tensor(0))
 
     @property
     def device(self):
-        return self.dummy.device
+        return self.step.device
 
     def reset(
         self,
         seed = None
     ):
         state = randn(self.state_shape, device = self.device)
+        self.step.zero_()
         return state
 
     def forward(
@@ -37,6 +42,13 @@ class Env(Module):
     ):
         state = randn(self.state_shape, device = self.device)
         reward = randint(0, 5, (), device = self.device).float()
-        done = torch.zeros((), device = self.device, dtype = torch.bool)
 
-        return state, reward, done
+        if self.step > self.can_terminate_after:
+            truncated = tensor(choice((True, False)), device =self.device)
+            terminated = tensor(choice((True, False)), device =self.device)
+        else:
+            truncated = terminated = tensor(False, device = self.device)
+
+        self.step.add_(1)
+
+        return state, reward, truncated, terminated
