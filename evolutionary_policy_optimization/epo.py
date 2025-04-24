@@ -681,6 +681,8 @@ class Agent(Module):
         actor_lr = 1e-4,
         critic_lr = 1e-4,
         latent_lr = 1e-5,
+        actor_weight_decay = 1e-3,
+        critic_weight_decay = 1e-3,
         diversity_aux_loss_weight = 0.,
         use_critic_ema = True,
         critic_ema_beta = 0.99,
@@ -737,8 +739,8 @@ class Agent(Module):
 
         # optimizers
 
-        self.actor_optim = optim_klass(actor.parameters(), lr = actor_lr, **actor_optim_kwargs)
-        self.critic_optim = optim_klass(critic.parameters(), lr = critic_lr, **critic_optim_kwargs)
+        self.actor_optim = optim_klass(actor.parameters(), lr = actor_lr, weight_decay = actor_weight_decay, **actor_optim_kwargs)
+        self.critic_optim = optim_klass(critic.parameters(), lr = critic_lr, weight_decay = critic_weight_decay, **critic_optim_kwargs)
 
         self.latent_optim = optim_klass(latent_gene_pool.parameters(), lr = latent_lr, **latent_optim_kwargs) if exists(latent_gene_pool) and not latent_gene_pool.frozen_latents else None
 
