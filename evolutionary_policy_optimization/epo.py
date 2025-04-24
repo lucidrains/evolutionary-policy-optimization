@@ -55,6 +55,9 @@ def xnor(x, y):
 def divisible_by(num, den):
     return (num % den) == 0
 
+def to_device(inp, device):
+    return tree_map(lambda t: t.to(device) if is_tensor(t) else t, inp)
+
 # tensor helpers
 
 def l2norm(t):
@@ -744,6 +747,12 @@ class Agent(Module):
         self.has_diversity_loss = diversity_aux_loss_weight > 0.
         self.diversity_aux_loss_weight = diversity_aux_loss_weight
 
+        self.register_buffer('dummy', tensor(0))
+
+    @property
+    def device(self):
+        return self.dummy.device
+
     def save(self, path, overwrite = False):
         path = Path(path)
 
@@ -838,7 +847,10 @@ class Agent(Module):
         self,
         memories_and_cumulative_rewards: MemoriesAndCumulativeRewards,
         epochs = 2
+
     ):
+        memories_and_cumulative_rewards = to_device(memories_and_cumulative_rewards, self.device)
+
         memories, rewards_per_latent_episode = memories_and_cumulative_rewards
 
         # stack memories
@@ -1217,6 +1229,8 @@ class EPO(Module):
                     terminated
                 )
 
+                memory = Memory(*tuple(t.cpu() for t in memory))
+
                 memories.append(memory)
 
                 time += 1
@@ -1228,7 +1242,7 @@ class EPO(Module):
 
                 memory_for_gae = memory._replace(
                     episode_id = invalid_episode,
-                    value = next_value,
+                    value = next_value.cpu(),
                     done = tensor(True)
                 )
 
