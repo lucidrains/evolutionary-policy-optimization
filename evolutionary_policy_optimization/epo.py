@@ -626,8 +626,8 @@ class LatentGenePool(Module):
 
     def forward(
         self,
-        *args,
         latent_id: int | None = None,
+        *args,
         net: Module | None = None,
         net_latent_kwarg_name = 'latent',
         **kwargs,
