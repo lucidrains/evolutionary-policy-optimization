@@ -75,17 +75,19 @@ def test_create_agent(
 
 @pytest.mark.parametrize('frozen_latents', (False, True))
 @pytest.mark.parametrize('use_critic_ema', (False, True))
+@pytest.mark.parametrize('num_latents', (1, 8))
 @pytest.mark.parametrize('diversity_aux_loss_weight', (0., 1e-3))
 def test_e2e_with_mock_env(
     frozen_latents,
     use_critic_ema,
+    num_latents,
     diversity_aux_loss_weight
 ):
     from evolutionary_policy_optimization import create_agent, EPO, Env
 
     agent = create_agent(
         dim_state = 512,
-        num_latents = 8,
+        num_latents = num_latents,
         dim_latent = 32,
         actor_num_actions = 5,
         actor_dim_hiddens = (256, 128),

@@ -181,6 +181,8 @@ class MLP(Module):
         dim_latent = 0,
     ):
         super().__init__()
+        dim_latent = default(dim_latent, 0)
+
         assert len(dims) >= 2, 'must have at least two dimensions'
 
         # add the latent to the first dim
@@ -376,6 +378,7 @@ class LatentGenePool(Module):
         init_latent_fn: Callable | None = None
     ):
         super().__init__()
+        assert num_latents > 1
 
         maybe_l2norm = l2norm if l2norm_latent else identity
 
@@ -670,7 +673,7 @@ class Agent(Module):
         self,
         actor: Actor,
         critic: Critic,
-        latent_gene_pool: LatentGenePool,
+        latent_gene_pool: LatentGenePool | None,
         optim_klass = AdoptAtan2,
         actor_lr = 1e-4,
         critic_lr = 1e-4,
@@ -705,10 +708,14 @@ class Agent(Module):
         self.use_critic_ema = use_critic_ema
         self.critic_ema = EMA(critic, beta = critic_ema_beta, include_online_model = False, **ema_kwargs) if use_critic_ema else None
 
-        self.num_latents = latent_gene_pool.num_latents
         self.latent_gene_pool = latent_gene_pool
+        self.num_latents = latent_gene_pool.num_latents if exists(latent_gene_pool) else 1
+        self.has_latent_genes = exists(latent_gene_pool)
 
-        assert actor.dim_latent == critic.dim_latent == latent_gene_pool.dim_latent
+        assert actor.dim_latent == critic.dim_latent
+
+        if self.has_latent_genes:
+            assert latent_gene_pool.dim_latent == actor.dim_latent
 
         # gae function
 
@@ -730,7 +737,7 @@ class Agent(Module):
         self.actor_optim = optim_klass(actor.parameters(), lr = actor_lr, **actor_optim_kwargs)
         self.critic_optim = optim_klass(critic.parameters(), lr = critic_lr, **critic_optim_kwargs)
 
-        self.latent_optim = optim_klass(latent_gene_pool.parameters(), lr = latent_lr, **latent_optim_kwargs) if not latent_gene_pool.frozen_latents else None
+        self.latent_optim = optim_klass(latent_gene_pool.parameters(), lr = latent_lr, **latent_optim_kwargs) if exists(latent_gene_pool) and not latent_gene_pool.frozen_latents else None
 
         # promotes latents to be farther apart for diversity maintenance
 
@@ -746,7 +753,7 @@ class Agent(Module):
             actor = self.actor.state_dict(),
             critic = self.critic.state_dict(),
             critic_ema = self.critic_ema.state_dict() if self.use_critic_ema else None,
-            latents = self.latent_gene_pool.state_dict(),
+            latents = self.latent_gene_pool.state_dict() if self.has_latent_genes else None,
             actor_optim = self.actor_optim.state_dict(),
             critic_optim = self.critic_optim.state_dict(),
             latent_optim = self.latent_optim.state_dict() if exists(self.latent_optim) else None
@@ -768,7 +775,8 @@ class Agent(Module):
         if self.use_critic_ema:
             self.critic_ema.load_state_dict(pkg['critic_ema'])
 
-        self.latent_gene_pool.load_state_dict(pkg['latents'])
+        if exists(pkg.get('latents', None)):
+            self.latent_gene_pool.load_state_dict(pkg['latents'])
 
         self.actor_optim.load_state_dict(pkg['actor_optim'])
         self.critic_optim.load_state_dict(pkg['critic_optim'])
@@ -784,9 +792,8 @@ class Agent(Module):
         sample = False,
         temperature = 1.
     ):
-        assert exists(latent_id) or exists(latent)
 
-        if not exists(latent):
+        if not exists(latent) and exists(latent_id):
             latent = self.latent_gene_pool(latent_id = latent_id)
 
         logits = self.actor(state, latent)
@@ -807,9 +814,8 @@ class Agent(Module):
         latent = None,
         use_ema_if_available = False
     ):
-        assert exists(latent_id) or exists(latent)
 
-        if not exists(latent):
+        if not exists(latent) and exists(latent_id):
             latent = self.latent_gene_pool(latent_id = latent_id)
 
         critic_forward = self.critic
@@ -823,6 +829,9 @@ class Agent(Module):
         self,
         fitnesses
     ):
+        if not self.has_latent_genes:
+            return
+
         return self.latent_gene_pool.genetic_algorithm_step(fitnesses)
 
     def forward(
@@ -893,11 +902,14 @@ class Agent(Module):
                 old_values
             ) in dataloader:
 
-                latents = self.latent_gene_pool(latent_id = latent_gene_ids)
+                if self.has_latent_genes:
+                    latents = self.latent_gene_pool(latent_id = latent_gene_ids)
 
-                orig_latents = latents
-                latents = latents.detach()
-                latents.requires_grad_()
+                    orig_latents = latents
+                    latents = latents.detach()
+                    latents.requires_grad_()
+                else:
+                    latents = None
 
                 # learn actor
 
@@ -936,7 +948,7 @@ class Agent(Module):
 
                 # maybe update latents, if not frozen
 
-                if self.latent_gene_pool.frozen_latents:
+                if not self.has_latent_genes or self.latent_gene_pool.frozen_latents:
                     continue
 
                 orig_latents.backward(latents.grad)
@@ -952,7 +964,9 @@ class Agent(Module):
 
         # apply evolution
 
-        self.latent_gene_pool.genetic_algorithm_step(fitness_scores)
+        if self.has_latent_genes:
+
+            self.latent_gene_pool.genetic_algorithm_step(fitness_scores)
 
 # reinforcement learning related - ppo
 
@@ -1005,11 +1019,16 @@ def create_agent(
     **kwargs
 ) -> Agent:
 
+    has_latent_genes = num_latents > 1
+
+    if not has_latent_genes:
+        dim_latent = None
+
     latent_gene_pool = LatentGenePool(
         num_latents = num_latents,
         dim_latent = dim_latent,
         **latent_gene_pool_kwargs
-    )
+    ) if has_latent_genes else None
 
     actor = Actor(
         num_actions = actor_num_actions,
@@ -1069,7 +1088,7 @@ class EPO(Module):
         self.agent = agent
         self.action_sample_temperature = action_sample_temperature
 
-        self.num_latents = agent.latent_gene_pool.num_latents
+        self.num_latents = agent.latent_gene_pool.num_latents if agent.has_latent_genes else 1
         self.episodes_per_latent = episodes_per_latent
         self.max_episode_length = max_episode_length
         self.fix_environ_across_latents = fix_environ_across_latents
@@ -1159,7 +1178,7 @@ class EPO(Module):
 
             # get latent from pool
 
-            latent = self.agent.latent_gene_pool(latent_id = latent_id)
+            latent = self.agent.latent_gene_pool(latent_id = latent_id) if self.agent.has_latent_genes else None
 
             # until maximum episode length
 
