@@ -62,11 +62,14 @@ from evolutionary_policy_optimization import (
 
 agent = create_agent(
     dim_state = 512,
-    num_latents = 8,
+    num_latents = 16,
     dim_latent = 32,
     actor_num_actions = 5,
     actor_dim_hiddens = (256, 128),
-    critic_dim_hiddens = (256, 128, 64)
+    critic_dim_hiddens = (256, 128, 64),
+    latent_gene_pool_kwargs = dict(
+        frac_natural_selected = 0.5
+    )
 )
 
 epo = EPO(
@@ -78,9 +81,7 @@ epo = EPO(
 
 env = Env((512,))
 
-memories = epo(env)
-
-agent(memories)
+epo(agent, env, num_learning_cycles = 5)
 
 # saving and loading
 

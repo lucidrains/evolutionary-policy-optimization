@@ -96,6 +96,8 @@ def test_e2e_with_mock_env(
         diversity_aux_loss_weight = diversity_aux_loss_weight,
         latent_gene_pool_kwargs = dict(
             frozen_latents = frozen_latents,
+            frac_natural_selected = 0.75,
+            frac_tournaments = 0.9
         )
     )
 
@@ -108,9 +110,7 @@ def test_e2e_with_mock_env(
 
     env = Env((512,))
 
-    memories = epo(env)
-
-    agent(memories)
+    epo(agent, env, num_learning_cycles = 2)
 
     # saving and loading
 

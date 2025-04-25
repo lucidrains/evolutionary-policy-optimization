@@ -416,6 +416,8 @@ class LatentGenePool(Module):
         self.num_natural_selected = int(frac_natural_selected * latents_per_island)
         self.num_tournament_participants = int(frac_tournaments * self.num_natural_selected)
 
+        assert self.num_tournament_participants >= 2
+
         self.crossover_random  = crossover_random
 
         self.mutation_strength = mutation_strength
@@ -845,7 +847,7 @@ class Agent(Module):
 
         return self.latent_gene_pool.genetic_algorithm_step(fitnesses)
 
-    def forward(
+    def learn_from(
         self,
         memories_and_cumulative_rewards: MemoriesAndCumulativeRewards,
         epochs = 2
@@ -853,11 +855,13 @@ class Agent(Module):
     ):
         memories_and_cumulative_rewards = to_device(memories_and_cumulative_rewards, self.device)
 
-        memories, rewards_per_latent_episode = memories_and_cumulative_rewards
+        memories_list, rewards_per_latent_episode = memories_and_cumulative_rewards
 
         # stack memories
 
-        memories = map(stack, zip(*memories))
+        memories = map(stack, zip(*memories_list))
+
+        memories_list.clear()
 
         maybe_barrier()
 
@@ -979,7 +983,6 @@ class Agent(Module):
         # apply evolution
 
         if self.has_latent_genes:
-
             self.latent_gene_pool.genetic_algorithm_step(fitness_scores)
 
 # reinforcement learning related - ppo
@@ -1159,9 +1162,10 @@ class EPO(Module):
             yield latent_id, episode_id, maybe_seed
 
     @torch.no_grad()
-    def forward(
+    def gather_experience_from(
         self,
         env,
+        memories: list[Memory] | None = None,
         fix_environ_across_latents = None
     ) -> MemoriesAndCumulativeRewards:
 
@@ -1171,7 +1175,8 @@ class EPO(Module):
 
         invalid_episode = tensor(-1) # will use `episode_id` value of `-1` for the `next_value`, needed for not discarding last reward for generalized advantage estimate
 
-        memories: list[Memory] = []
+        if not exists(memories):
+            memories = []
 
         rewards_per_latent_episode = torch.zeros((self.num_latents, self.episodes_per_latent))
 
@@ -1254,3 +1259,18 @@ class EPO(Module):
             memories = memories,
             cumulative_rewards = rewards_per_latent_episode
         )
+
+    def forward(
+        self,
+        agent: Agent,
+        env,
+        num_learning_cycles
+    ):
+
+        for _ in tqdm(range(num_learning_cycles), desc = 'learning cycle'):
+
+            memories = self.gather_experience_from(env)
+
+            agent.learn_from(memories)
+
+        print(f'training complete')
