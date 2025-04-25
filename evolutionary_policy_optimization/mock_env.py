@@ -34,7 +34,7 @@ class Env(Module):
     ):
         state = randn(self.state_shape, device = self.device)
         self.step.zero_()
-        return state
+        return state.numpy()
 
     def forward(
         self,
@@ -51,4 +51,5 @@ class Env(Module):
 
         self.step.add_(1)
 
-        return state, reward, truncated, terminated
+        out = state, reward, truncated, terminated
+        return tuple(t.numpy() for t in out)

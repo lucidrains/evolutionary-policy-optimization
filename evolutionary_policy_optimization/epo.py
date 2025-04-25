@@ -8,8 +8,10 @@ from functools import partial, wraps
 from collections import namedtuple
 from random import randrange
 
+import numpy as np
+
 import torch
-from torch import nn, cat, stack, is_tensor, tensor, Tensor
+from torch import nn, cat, stack, is_tensor, tensor, from_numpy, Tensor
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn import Linear, Module, ModuleList
@@ -57,6 +59,21 @@ def divisible_by(num, den):
 
 def to_device(inp, device):
     return tree_map(lambda t: t.to(device) if is_tensor(t) else t, inp)
+
+def interface_torch_numpy(fn, device):
+    # for a given function, move all inputs from torch tensor to numpy, and all outputs from numpy to torch tensor
+
+    @wraps(fn)
+    def decorated_fn(*args, **kwargs):
+
+        args, kwargs = tree_map(lambda t: t.cpu().numpy() if isinstance(t, Tensor) else t, (args, kwargs))
+
+        out = fn(*args, **kwargs)
+
+        out = tree_map(lambda t: from_numpy(t).to(device) if isinstance(t, np.ndarray) else t, out)
+        return out
+
+    return decorated_fn
 
 # tensor helpers
 
@@ -1178,7 +1195,7 @@ class EPO(Module):
         if not exists(memories):
             memories = []
 
-        rewards_per_latent_episode = torch.zeros((self.num_latents, self.episodes_per_latent))
+        rewards_per_latent_episode = torch.zeros((self.num_latents, self.episodes_per_latent), device = self.device)
 
         rollout_gen = self.rollouts_for_machine(fix_environ_across_latents)
 
@@ -1193,7 +1210,7 @@ class EPO(Module):
             if fix_environ_across_latents:
                 reset_kwargs.update(seed = maybe_seed)
 
-            state = env.reset(**reset_kwargs)
+            state = interface_torch_numpy(env.reset, device = self.device)(**reset_kwargs)
 
             # get latent from pool
 
@@ -1215,7 +1232,7 @@ class EPO(Module):
 
                 # get the next state, action, and reward
 
-                state, reward, truncated, terminated = env(action)
+                state, reward, truncated, terminated = interface_torch_numpy(env.forward, device = self.device)(action)
 
                 done = truncated or terminated
 
