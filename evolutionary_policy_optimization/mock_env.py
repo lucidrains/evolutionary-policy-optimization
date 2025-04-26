@@ -22,34 +22,34 @@ class Env(Module):
         self.state_shape = cast_tuple(state_shape)
 
         self.can_terminate_after = can_terminate_after
-        self.register_buffer('step', tensor(0))
+        self.register_buffer('_step', tensor(0))
 
     @property
     def device(self):
-        return self.step.device
+        return self._step.device
 
     def reset(
         self,
         seed = None
     ):
         state = randn(self.state_shape, device = self.device)
-        self.step.zero_()
-        return state.numpy()
+        self._step.zero_()
+        return state.numpy(), None
 
-    def forward(
+    def step(
         self,
         actions,
     ):
         state = randn(self.state_shape, device = self.device)
         reward = randint(0, 5, (), device = self.device).float()
 
-        if self.step > self.can_terminate_after:
+        if self._step > self.can_terminate_after:
             truncated = tensor(choice((True, False)), device =self.device)
             terminated = tensor(choice((True, False)), device =self.device)
         else:
             truncated = terminated = tensor(False, device = self.device)
 
-        self.step.add_(1)
+        self._step.add_(1)
 
-        out = state, reward, truncated, terminated
-        return tuple(t.numpy() for t in out)
+        out = (state, reward, truncated, terminated)
+        return (*tuple(t.numpy() for t in out), None)

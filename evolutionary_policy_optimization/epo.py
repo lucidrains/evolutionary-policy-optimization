@@ -70,7 +70,7 @@ def interface_torch_numpy(fn, device):
 
         out = fn(*args, **kwargs)
 
-        out = tree_map(lambda t: from_numpy(t).to(device) if isinstance(t, np.ndarray) else t, out)
+        out = tree_map(lambda t: from_numpy(np.array(t)).to(device) if isinstance(t, (np.ndarray, np.float64)) else t, out)
         return out
 
     return decorated_fn
@@ -1176,7 +1176,7 @@ class EPO(Module):
             if fix_environ_across_latents:
                 maybe_seed = environment_seeds[episode_id]
 
-            yield latent_id, episode_id, maybe_seed
+            yield latent_id, episode_id, maybe_seed.item()
 
     @torch.no_grad()
     def gather_experience_from(
@@ -1210,7 +1210,7 @@ class EPO(Module):
             if fix_environ_across_latents:
                 reset_kwargs.update(seed = maybe_seed)
 
-            state = interface_torch_numpy(env.reset, device = self.device)(**reset_kwargs)
+            state, _ = interface_torch_numpy(env.reset, device = self.device)(**reset_kwargs)
 
             # get latent from pool
 
@@ -1232,7 +1232,7 @@ class EPO(Module):
 
                 # get the next state, action, and reward
 
-                state, reward, truncated, terminated = interface_torch_numpy(env.forward, device = self.device)(action)
+                state, reward, truncated, terminated, _ = interface_torch_numpy(env.step, device = self.device)(action)
 
                 done = truncated or terminated
 
@@ -1250,7 +1250,7 @@ class EPO(Module):
                     log_prob,
                     reward,
                     value,
-                    terminated
+                    tensor(terminated)
                 )
 
                 memory = Memory(*tuple(t.cpu() for t in memory))
