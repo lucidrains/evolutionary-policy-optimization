@@ -13,12 +13,7 @@ num_actions = env.action_space.n
 # epo
 
 import torch
-
-from evolutionary_policy_optimization import (
-    create_agent,
-    EPO,
-    Env
-)
+from evolutionary_policy_optimization import create_agent, EPO
 
 agent = create_agent(
     dim_state = state_dim,
@@ -41,4 +36,6 @@ epo = EPO(
 
 epo.to('cpu' if not torch.cuda.is_available() else 'cuda')
 
-epo(agent, env, num_learning_cycles = 5)
+epo(agent, env, num_learning_cycles = 1)
+
+agent.save('./agent.pt', overwrite = True)
