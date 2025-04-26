@@ -1281,8 +1281,13 @@ class EPO(Module):
         self,
         agent: Agent,
         env,
-        num_learning_cycles
+        num_learning_cycles,
+        seed = None
     ):
+
+        if exists(seed):
+            torch.manual_seed(seed)
+            np.random.seed(seed)
 
         for _ in tqdm(range(num_learning_cycles), desc = 'learning cycle'):
 
