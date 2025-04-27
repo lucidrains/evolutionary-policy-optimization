@@ -40,6 +40,8 @@ from ema_pytorch import EMA
 
 from tqdm import tqdm
 
+from accelerate import Accelerator
+
 # helpers
 
 def exists(v):
@@ -59,6 +61,17 @@ def divisible_by(num, den):
 
 def to_device(inp, device):
     return tree_map(lambda t: t.to(device) if is_tensor(t) else t, inp)
+
+def maybe(fn):
+
+    @wraps(fn)
+    def decorated(inp, *args, **kwargs):
+        if not exists(inp):
+            return None
+
+        return fn(inp, *args, **kwargs)
+
+    return decorated
 
 def interface_torch_numpy(fn, device):
     # for a given function, move all inputs from torch tensor to numpy, and all outputs from numpy to torch tensor
@@ -721,9 +734,21 @@ class Agent(Module):
         actor_optim_kwargs: dict = dict(),
         critic_optim_kwargs: dict = dict(),
         latent_optim_kwargs: dict = dict(),
-        get_fitness_scores: Callable[..., Tensor] = get_fitness_scores
+        get_fitness_scores: Callable[..., Tensor] = get_fitness_scores,
+        wrap_with_accelerate: bool = True,
+        accelerate_kwargs: dict = dict(),
     ):
         super().__init__()
+
+        # hf accelerate
+
+        self.wrap_with_accelerate = wrap_with_accelerate
+
+        if wrap_with_accelerate:
+            accelerate = Accelerator(**accelerate_kwargs)
+            self.accelerate = accelerate
+
+        # actor, critic, and their shared latent gene pool
 
         self.actor = actor
 
@@ -768,11 +793,42 @@ class Agent(Module):
         self.has_diversity_loss = diversity_aux_loss_weight > 0.
         self.diversity_aux_loss_weight = diversity_aux_loss_weight
 
-        self.register_buffer('dummy', tensor(0))
+        # wrap with accelerate
+
+        self.unwrap_model = identity if not wrap_with_accelerate else self.accelerate.unwrap_model
+
+        if wrap_with_accelerate:
+            (
+                self.actor,
+                self.critic,
+                self.latent_gene_pool,
+                self.actor_optim,
+                self.critic_optim,
+                self.latent_optim,
+            ) = tuple(
+                maybe(self.accelerate.prepare)(m) for m in (
+                    self.actor,
+                    self.critic,
+                    self.latent_gene_pool,
+                    self.actor_optim,
+                    self.critic_optim,
+                    self.latent_optim,
+                )
+            )
+
+        # device tracking
+
+        self.register_buffer('dummy', tensor(0, device = self.accelerate.device))
+
+        self.critic_ema.to(self.accelerate.device)
 
     @property
     def device(self):
         return self.dummy.device
+
+    @property
+    def unwrapped_latent_gene_pool(self):
+        return self.unwrap_model(self.latent_gene_pool)
 
     def save(self, path, overwrite = False):
         path = Path(path)
@@ -820,13 +876,15 @@ class Agent(Module):
         latent_id = None,
         latent = None,
         sample = False,
-        temperature = 1.
+        temperature = 1.,
+        use_unwrapped_model = False
     ):
+        maybe_unwrap = identity if not use_unwrapped_model else self.unwrap_model
 
         if not exists(latent) and exists(latent_id):
-            latent = self.latent_gene_pool(latent_id = latent_id)
+            latent = maybe_unwrap(self.latent_gene_pool)(latent_id = latent_id)
 
-        logits = self.actor(state, latent)
+        logits = maybe_unwrap(self.actor)(state, latent)
 
         if not sample:
             return logits
@@ -842,13 +900,15 @@ class Agent(Module):
         state,
         latent_id = None,
         latent = None,
-        use_ema_if_available = False
+        use_ema_if_available = False,
+        use_unwrapped_model = False
     ):
+        maybe_unwrap = identity if not use_unwrapped_model else self.unwrap_model
 
         if not exists(latent) and exists(latent_id):
-            latent = self.latent_gene_pool(latent_id = latent_id)
+            latent = maybe_unwrap(self.latent_gene_pool)(latent_id = latent_id)
 
-        critic_forward = self.critic
+        critic_forward = maybe_unwrap(self.critic)
 
         if use_ema_if_available and self.use_critic_ema:
             critic_forward = self.critic_ema
@@ -922,6 +982,9 @@ class Agent(Module):
 
         dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
 
+        if self.wrap_with_accelerate:
+            dataloader = self.accelerate.prepare(dataloader)
+
         # updating actor and critic
 
         self.actor.train()
@@ -955,7 +1018,7 @@ class Agent(Module):
                 actor_loss.backward()
 
                 if exists(self.has_grad_clip):
-                    nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                    self.accelerate.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
 
                 self.actor_optim.step()
                 self.actor_optim.zero_grad()
@@ -971,7 +1034,7 @@ class Agent(Module):
                 critic_loss.backward()
 
                 if exists(self.has_grad_clip):
-                    nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+                    self.accelerate.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
                 self.critic_optim.step()
                 self.critic_optim.zero_grad()
@@ -993,6 +1056,9 @@ class Agent(Module):
                     diversity_loss = (-diversity).tril(-1).exp().mean()
 
                     (diversity_loss * self.diversity_aux_loss_weight).backward()
+
+                if exists(self.has_grad_clip):
+                    self.accelerate.clip_grad_norm_(self.latent_gene_pool.parameters(), self.max_grad_norm)
 
                 self.latent_optim.step()
                 self.latent_optim.zero_grad()
@@ -1128,7 +1194,7 @@ class EPO(Module):
         self.max_episode_length = max_episode_length
         self.fix_environ_across_latents = fix_environ_across_latents
 
-        self.register_buffer('dummy', tensor(0))
+        self.register_buffer('dummy', tensor(0, device = agent.device))
 
     @property
     def device(self):
@@ -1215,7 +1281,7 @@ class EPO(Module):
 
             # get latent from pool
 
-            latent = self.agent.latent_gene_pool(latent_id = latent_id) if self.agent.has_latent_genes else None
+            latent = self.agent.unwrapped_latent_gene_pool(latent_id = latent_id) if self.agent.has_latent_genes else None
 
             # until maximum episode length
 
@@ -1225,11 +1291,11 @@ class EPO(Module):
 
                 # sample action
 
-                action, log_prob = temp_batch_dim(self.agent.get_actor_actions)(state, latent = latent, sample = True, temperature = self.action_sample_temperature)
+                action, log_prob = temp_batch_dim(self.agent.get_actor_actions)(state, latent = latent, sample = True, temperature = self.action_sample_temperature, use_unwrapped_model = True)
 
                 # values
 
-                value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent, use_ema_if_available = True)
+                value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent, use_ema_if_available = True, use_unwrapped_model = True)
 
                 # get the next state, action, and reward
 

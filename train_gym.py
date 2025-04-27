@@ -26,18 +26,19 @@ agent = env.to_epo_agent(
     latent_gene_pool_kwargs = dict(
         frac_natural_selected = 0.5,
         frac_tournaments = 0.5
+    ),
+    accelerate_kwargs = dict(
+        cpu = False
     )
 )
 
 epo = EPO(
     agent,
-    episodes_per_latent = 1,
+    episodes_per_latent = 5,
     max_episode_length = 10,
-    action_sample_temperature = 1.
+    action_sample_temperature = 1.,
 )
 
-epo.to('cpu' if not torch.cuda.is_available() else 'cuda')
-
-epo(agent, env, num_learning_cycles = 1)
+epo(agent, env, num_learning_cycles = 5)
 
 agent.save('./agent.pt', overwrite = True)
