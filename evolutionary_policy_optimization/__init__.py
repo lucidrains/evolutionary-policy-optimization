@@ -9,3 +9,7 @@ from evolutionary_policy_optimization.epo import (
 )
 
 from evolutionary_policy_optimization.mock_env import Env
+
+from evolutionary_policy_optimization.env_wrappers import (
+    GymnasiumEnvWrapper
+)

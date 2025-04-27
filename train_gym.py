@@ -1,3 +1,10 @@
+import torch
+
+from evolutionary_policy_optimization import (
+    EPO,
+    GymnasiumEnvWrapper
+)
+
 # gymnasium
 
 import gymnasium as gym
@@ -7,23 +14,18 @@ env = gym.make(
     render_mode = 'rgb_array'
 )
 
-state_dim = env.observation_space.shape[0]
-num_actions = env.action_space.n
+env = GymnasiumEnvWrapper(env)
 
 # epo
 
-import torch
-from evolutionary_policy_optimization import create_agent, EPO
-
-agent = create_agent(
-    dim_state = state_dim,
-    num_latents = 1,
+agent = env.to_epo_agent(
+    num_latents = 8,
     dim_latent = 32,
-    actor_num_actions = num_actions,
     actor_dim_hiddens = (256, 128),
     critic_dim_hiddens = (256, 128, 64),
     latent_gene_pool_kwargs = dict(
-        frac_natural_selected = 0.5
+        frac_natural_selected = 0.5,
+        frac_tournaments = 0.5
     )
 )
 

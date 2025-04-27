@@ -1040,6 +1040,7 @@ def actor_loss(
 # agent contains the actor, critic, and the latent genetic pool
 
 def create_agent(
+    *,
     dim_state,
     num_latents,
     dim_latent,
