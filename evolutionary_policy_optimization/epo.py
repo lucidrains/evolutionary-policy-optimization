@@ -79,12 +79,22 @@ def interface_torch_numpy(fn, device):
     @wraps(fn)
     def decorated_fn(*args, **kwargs):
 
-        args, kwargs = tree_map(lambda t: t.cpu().numpy() if isinstance(t, Tensor) else t, (args, kwargs))
+        args, kwargs = tree_map(lambda t: t.cpu().numpy() if is_tensor(t) else t, (args, kwargs))
 
         out = fn(*args, **kwargs)
 
         out = tree_map(lambda t: from_numpy(np.array(t)).to(device) if isinstance(t, (np.ndarray, np.float64)) else t, out)
         return out
+
+    return decorated_fn
+
+def move_input_tensors_to_device(fn):
+
+    @wraps(fn)
+    def decorated_fn(self, *args, **kwargs):
+        args, kwargs = tree_map(lambda t: t.to(self.device) if is_tensor(t) else t, (args, kwargs))
+
+        return fn(self, *args, **kwargs)
 
     return decorated_fn
 
@@ -797,6 +807,8 @@ class Agent(Module):
 
         self.unwrap_model = identity if not wrap_with_accelerate else self.accelerate.unwrap_model
 
+        dummy = tensor(0)
+
         if wrap_with_accelerate:
             (
                 self.actor,
@@ -816,11 +828,14 @@ class Agent(Module):
                 )
             )
 
+            if exists(self.critic_ema):
+                self.critic_ema.to(self.accelerate.device)
+
+            dummy = dummy.to(self.accelerate.device)
+
         # device tracking
 
-        self.register_buffer('dummy', tensor(0, device = self.accelerate.device))
-
-        self.critic_ema.to(self.accelerate.device)
+        self.register_buffer('dummy', dummy)
 
     @property
     def device(self):
@@ -870,6 +885,7 @@ class Agent(Module):
         if exists(pkg.get('latent_optim', None)):
             self.latent_optim.load_state_dict(pkg['latent_optim'])
 
+    @move_input_tensors_to_device
     def get_actor_actions(
         self,
         state,
@@ -895,6 +911,7 @@ class Agent(Module):
 
         return actions, log_probs
 
+    @move_input_tensors_to_device
     def get_critic_values(
         self,
         state,
@@ -903,6 +920,7 @@ class Agent(Module):
         use_ema_if_available = False,
         use_unwrapped_model = False
     ):
+
         maybe_unwrap = identity if not use_unwrapped_model else self.unwrap_model
 
         if not exists(latent) and exists(latent_id):
