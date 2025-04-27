@@ -132,4 +132,15 @@ agent.load('./agent.pt')
 }
 ```
 
+```bibtex
+@article{Banerjee2022BoostingEI,
+    title   = {Boosting Exploration in Actor-Critic Algorithms by Incentivizing Plausible Novel States},
+    author  = {Chayan Banerjee and Zhiyong Chen and Nasimul Noman},
+    journal = {2023 62nd IEEE Conference on Decision and Control (CDC)},
+    year    = {2022},
+    pages   = {7009-7014},
+    url     = {https://api.semanticscholar.org/CorpusID:252682944}
+}
+```
+
 *Evolution is cleverer than you are.* - Leslie Orgel
