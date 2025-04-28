@@ -385,7 +385,7 @@ class Critic(Module):
 
         clipped_value = old_values + (value - old_values).clamp(1. - eps_clip, 1. + eps_clip)
 
-        loss = self.loss_fn(value, target, reduction = 'none')
+        loss = self.loss_fn(logits, target, reduction = 'none')
         clipped_loss = self.loss_fn(clipped_value, target, reduction = 'none')
 
         return torch.max(loss, clipped_loss).mean()
@@ -843,7 +843,11 @@ class Agent(Module):
 
         dummy = tensor(0)
 
+        self.clip_grad_norm_ = nn.utils.clip_grad_norm_
+
         if wrap_with_accelerate:
+            self.clip_grad_norm_ = self.accelerate.clip_grad_norm_
+
             (
                 self.actor,
                 self.critic,
@@ -1070,7 +1074,7 @@ class Agent(Module):
                 actor_loss.backward()
 
                 if exists(self.has_grad_clip):
-                    self.accelerate.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                    self.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
 
                 self.actor_optim.step()
                 self.actor_optim.zero_grad()
@@ -1088,7 +1092,7 @@ class Agent(Module):
                 critic_loss.backward()
 
                 if exists(self.has_grad_clip):
-                    self.accelerate.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+                    self.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
                 self.critic_optim.step()
                 self.critic_optim.zero_grad()
@@ -1112,7 +1116,7 @@ class Agent(Module):
                     (diversity_loss * self.diversity_aux_loss_weight).backward()
 
                 if exists(self.has_grad_clip):
-                    self.accelerate.clip_grad_norm_(self.latent_gene_pool.parameters(), self.max_grad_norm)
+                    self.clip_grad_norm_(self.latent_gene_pool.parameters(), self.max_grad_norm)
 
                 self.latent_optim.step()
                 self.latent_optim.zero_grad()

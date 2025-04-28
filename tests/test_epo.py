@@ -103,7 +103,8 @@ def test_e2e_with_mock_env(
             frozen_latents = frozen_latents,
             frac_natural_selected = 0.75,
             frac_tournaments = 0.9
-        )
+        ),
+        wrap_with_accelerate = False
     )
 
     epo = EPO(
