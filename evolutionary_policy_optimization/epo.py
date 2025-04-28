@@ -207,12 +207,59 @@ def mutation(
 ):
     mutations = torch.randn_like(latents)
 
-    mutated = latents + mutations * mutation_strength
+    if is_tensor(mutation_strength):
+        mutations = einx.multiply('b, b ...', mutation_strength, mutations)
+    else:
+        mutations *= mutation_strength
+
+    mutated = latents + mutations
 
     if not l2norm_output:
         return mutated
 
     return l2norm(mutated)
+
+# drawing mutation strengths from power law distribution
+# proposed by https://arxiv.org/abs/1703.03334
+
+class PowerLawDist(Module):
+    def __init__(
+        self,
+        values: Tensor | list[float] | None = None,
+        bins = None,
+        beta = 1.5,
+    ):
+        super().__init__()
+        assert beta > 1.
+
+        assert exists(bins) or exists(values)
+
+        if exists(values):
+            if not is_tensor(values):
+                values = tensor(values)
+
+            assert values.ndim == 1
+            bins = values.shape[0]
+
+        self.beta = beta
+
+        cdf = torch.linspace(1, bins, bins).pow(-beta).cumsum(dim = -1)
+        cdf = cdf / cdf[-1]
+
+        self.register_buffer('cdf', cdf)
+        self.register_buffer('values', values)
+
+    def forward(self, shape):
+        device = self.cdf.device
+
+        uniform = torch.rand(shape, device = device)
+
+        sampled = torch.searchsorted(self.cdf, uniform)
+
+        if not exists(self.values):
+            return sampled
+
+        return self.values[sampled]
 
 # simple MLP networks, but with latent variables
 # the latent variables are the "genes" with the rest of the network as the scaffold for "gene expression" - as suggested in the paper
@@ -441,6 +488,8 @@ class LatentGenePool(Module):
         frac_elitism = 0.1,              # frac of population to preserve from being noised
         frac_migrate = 0.1,              # frac of population, excluding elites, that migrate between islands randomly. will use a designated set migration pattern (since for some reason using random it seems to be worse for me)
         mutation_strength = 1.,          # factor to multiply to gaussian noise as mutation to latents
+        fast_genetic_algorithm = False,
+        fast_ga_values = torch.linspace(1, 5, 10),
         should_run_genetic_algorithm: Module | None = None, # eq (3) in paper
         default_should_run_ga_gamma = 1.5,
         migrate_every = 100,                 # how many steps before a migration between islands
@@ -488,6 +537,8 @@ class LatentGenePool(Module):
         self.crossover_random  = crossover_random
 
         self.mutation_strength = mutation_strength
+        self.mutation_strength_sampler = PowerLawDist(fast_ga_values) if fast_genetic_algorithm else None
+
         self.num_elites = int(frac_elitism * latents_per_island)
         self.has_elites = self.num_elites > 0
 
@@ -656,9 +707,14 @@ class LatentGenePool(Module):
         if self.has_elites:
             genes, elites = genes[:, :-self.num_elites], genes[:, -self.num_elites:]
 
-        # 5. mutate with gaussian noise - todo: add drawing the mutation rate from exponential distribution, from the fast genetic algorithms paper from 2017
+        # 5. mutate with gaussian noise
 
-        genes = mutation(genes, mutation_strength = self.mutation_strength)
+        if exists(self.mutation_strength_sampler):
+            mutation_strength = self.mutation_strength_sampler(genes.shape[:1])
+        else:
+            mutation_strength = self.mutation_strength
+
+        genes = mutation(genes, mutation_strength = mutation_strength)
 
         # 6. maybe migration
 

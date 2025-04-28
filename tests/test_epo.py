@@ -9,15 +9,18 @@ from evolutionary_policy_optimization import (
 
 @pytest.mark.parametrize('latent_ids', (2, (2, 4)))
 @pytest.mark.parametrize('num_islands', (1, 4))
+@pytest.mark.parametrize('sampled_mutation_strengths', (False, True))
 def test_readme(
     latent_ids,
-    num_islands
+    num_islands,
+    sampled_mutation_strengths
 ):
 
     latent_pool = LatentGenePool(
         num_latents = 128,
         dim_latent = 32,        
         num_islands = num_islands,
+        fast_genetic_algorithm = sampled_mutation_strengths
     )
 
     state = torch.randn(2, 512)

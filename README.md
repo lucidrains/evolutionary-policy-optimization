@@ -143,4 +143,14 @@ agent.load('./agent.pt')
 }
 ```
 
+```bibtex
+@article{Doerr2017FastGA,
+    title   = {Fast genetic algorithms},
+    author  = {Benjamin Doerr and Huu Phuoc Le and R{\'e}gis Makhmara and Ta Duy Nguyen},
+    journal = {Proceedings of the Genetic and Evolutionary Computation Conference},
+    year    = {2017},
+    url     = {https://api.semanticscholar.org/CorpusID:16196841}
+}
+```
+
 *Evolution is cleverer than you are.* - Leslie Orgel
