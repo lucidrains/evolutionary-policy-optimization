@@ -364,11 +364,38 @@ class Critic(Module):
             hl_gauss_loss = hl_gauss_loss_kwargs
         )
 
+        self.use_regression = use_regression
+
+        hl_gauss_loss = self.to_pred.hl_gauss_loss
+
+        self.maybe_bins_to_value = hl_gauss_loss if not use_regression else identity
+        self.maybe_value_to_bins = hl_gauss_loss.transform_to_logprobs if not use_regression else identity
+        self.loss_fn = hl_gauss_loss if not use_regression else F.mse_loss
+
+    def forward_for_loss(
+        self,
+        state,
+        latent,
+        old_values,
+        target,
+        eps_clip = 0.4
+    ):
+        logits = self.forward(state, latent, return_logits = True)
+
+        value = self.maybe_bins_to_value(logits)
+
+        clipped_value = old_values + (value - old_values).clamp(1. - eps_clip, 1. + eps_clip)
+
+        loss = self.loss_fn(value, target, reduction = 'none')
+        clipped_loss = self.loss_fn(clipped_value, target, reduction = 'none')
+
+        return torch.max(loss, clipped_loss).mean()
+
     def forward(
         self,
         state,
         latent,
-        target = None
+        return_logits = False
     ):
 
         hidden = self.init_layer(state)
@@ -377,7 +404,8 @@ class Critic(Module):
 
         hidden = self.final_act(hidden)
 
-        return self.to_pred(hidden, target = target)
+        pred_kwargs = dict(return_logits = return_logits) if not self.use_regression else dict()
+        return self.to_pred(hidden, **pred_kwargs)
 
 # criteria for running genetic algorithm
 
@@ -740,6 +768,9 @@ class Agent(Module):
             entropy_weight = .01,
             norm_advantages = True
         ),
+        critic_loss_kwargs: dict = dict(
+            eps_clip = 0.4
+        ),
         ema_kwargs: dict = dict(),
         actor_optim_kwargs: dict = dict(),
         critic_optim_kwargs: dict = dict(),
@@ -778,8 +809,12 @@ class Agent(Module):
 
         # gae function
 
-        self.actor_loss = partial(actor_loss, **actor_loss_kwargs)
         self.calc_gae = partial(calc_generalized_advantage_estimate, **calc_gae_kwargs)
+
+        # actor critic loss related
+
+        self.actor_loss = partial(actor_loss, **actor_loss_kwargs)
+        self.critic_loss_kwargs = critic_loss_kwargs
 
         # fitness score related
 
@@ -1043,10 +1078,12 @@ class Agent(Module):
 
                 # learn critic with maybe classification loss
 
-                critic_loss = self.critic(
+                critic_loss = self.critic.forward_for_loss(
                     states,
                     latents,
-                    target = advantages + old_values
+                    old_values = old_values,
+                    target = advantages + old_values,
+                    **self.critic_loss_kwargs
                 )
 
                 critic_loss.backward()

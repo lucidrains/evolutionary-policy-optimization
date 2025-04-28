@@ -75,13 +75,15 @@ def test_create_agent(
 
 @pytest.mark.parametrize('frozen_latents', (False, True))
 @pytest.mark.parametrize('use_critic_ema', (False, True))
+@pytest.mark.parametrize('critic_use_regression', (False, True))
 @pytest.mark.parametrize('num_latents', (1, 8))
 @pytest.mark.parametrize('diversity_aux_loss_weight', (0., 1e-3))
 def test_e2e_with_mock_env(
     frozen_latents,
     use_critic_ema,
     num_latents,
-    diversity_aux_loss_weight
+    diversity_aux_loss_weight,
+    critic_use_regression
 ):
     from evolutionary_policy_optimization import create_agent, EPO, Env
 
@@ -94,6 +96,9 @@ def test_e2e_with_mock_env(
         critic_dim_hiddens = (256, 128, 64),
         use_critic_ema = use_critic_ema,
         diversity_aux_loss_weight = diversity_aux_loss_weight,
+        critic_kwargs = dict(
+            use_regression = critic_use_regression
+        ),
         latent_gene_pool_kwargs = dict(
             frozen_latents = frozen_latents,
             frac_natural_selected = 0.75,
