@@ -153,4 +153,13 @@ agent.load('./agent.pt')
 }
 ```
 
+```bibtex
+@article{Lee2024AnalysisClippedCritic
+    title   = {On Analysis of Clipped Critic Loss in Proximal Policy Gradient},
+    author  = {Yongjin Lee, Moonyoung Chung},
+    journal = {Authorea},
+    year    = {2024}
+}
+```
+
 *Evolution is cleverer than you are.* - Leslie Orgel

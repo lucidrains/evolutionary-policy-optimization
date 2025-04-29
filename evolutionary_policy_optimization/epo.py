@@ -424,18 +424,38 @@ class Critic(Module):
         latent,
         old_values,
         target,
-        eps_clip = 0.4
+        eps_clip = 0.4,
+        use_improved = True
     ):
         logits = self.forward(state, latent, return_logits = True)
 
         value = self.maybe_bins_to_value(logits)
 
-        clipped_value = old_values + (value - old_values).clamp(1. - eps_clip, 1. + eps_clip)
+        if use_improved:
+            clipped_target = target.clamp(-eps_clip, eps_clip)
 
-        loss = self.loss_fn(logits, target, reduction = 'none')
-        clipped_loss = self.loss_fn(clipped_value, target, reduction = 'none')
+            old_values_lo = old_values - eps_clip
+            old_values_hi = old_values + eps_clip
 
-        return torch.max(loss, clipped_loss).mean()
+            is_between = lambda lo, hi: (lo < value) & (value < hi)
+
+            clipped_loss = self.loss_fn(logits, clipped_target, reduction = 'none')
+            loss = self.loss_fn(logits, target, reduction = 'none')
+
+            value_loss = torch.where(
+                is_between(target, old_values_lo) | is_between(old_values_hi, target),
+                0.,
+                torch.min(loss, clipped_loss)
+            )
+        else:
+            clipped_value = old_values + (value - old_values).clamp(1. - eps_clip, 1. + eps_clip)
+
+            loss = self.loss_fn(logits, target, reduction = 'none')
+            clipped_loss = self.loss_fn(clipped_value, target, reduction = 'none')
+
+            value_loss = torch.max(loss, clipped_loss)
+
+        return value_loss.mean()
 
     def forward(
         self,
@@ -826,6 +846,7 @@ class Agent(Module):
         critic_loss_kwargs: dict = dict(
             eps_clip = 0.4
         ),
+        use_improved_critic_loss = True,
         ema_kwargs: dict = dict(),
         actor_optim_kwargs: dict = dict(),
         critic_optim_kwargs: dict = dict(),
@@ -870,6 +891,8 @@ class Agent(Module):
 
         self.actor_loss = partial(actor_loss, **actor_loss_kwargs)
         self.critic_loss_kwargs = critic_loss_kwargs
+
+        self.use_improved_critic_loss = use_improved_critic_loss
 
         # fitness score related
 
@@ -1142,6 +1165,7 @@ class Agent(Module):
                     latents,
                     old_values = old_values,
                     target = advantages + old_values,
+                    use_improved = self.use_improved_critic_loss,
                     **self.critic_loss_kwargs
                 )
 
