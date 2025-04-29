@@ -1,10 +1,11 @@
 import pytest
 
 import torch
-from evolutionary_policy_optimization import (
+from evolutionary_policy_optimization.epo import (
     LatentGenePool,
     Actor,
-    Critic
+    Critic,
+    shrink_and_perturb_
 )
 
 @pytest.mark.parametrize('latent_ids', (2, (2, 4)))
@@ -128,3 +129,5 @@ def test_e2e_with_mock_env(
 
     agent.save('./agent.pt', overwrite = True)
     agent.load('./agent.pt')
+
+    shrink_and_perturb_(agent)

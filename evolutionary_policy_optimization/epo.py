@@ -146,6 +146,24 @@ def temp_batch_dim(fn):
 
     return inner
 
+# plasticity related
+
+def shrink_and_perturb_(
+    module,
+    shrink_factor = 0.5,
+    perturb_factor = 0.01
+):
+    # Shrink & Perturb
+    # Ash et al. https://arxiv.org/abs/1910.08475
+
+    assert 0. <= shrink_factor <= 1.
+
+    for p in module.parameters():
+        noise = torch.randn_like(p.data)
+        p.data.mul_(1. - shrink_factor).add_(noise * perturb_factor)
+
+    return module
+
 # fitness related
 
 def get_fitness_scores(
