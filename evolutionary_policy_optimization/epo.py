@@ -431,6 +431,8 @@ class Critic(Module):
 
         value = self.maybe_bins_to_value(logits)
 
+        loss_fn = partial(self.loss_fn, reduction = 'none')
+
         if use_improved:
             clipped_target = target.clamp(-eps_clip, eps_clip)
 
@@ -439,8 +441,8 @@ class Critic(Module):
 
             is_between = lambda lo, hi: (lo < value) & (value < hi)
 
-            clipped_loss = self.loss_fn(logits, clipped_target, reduction = 'none')
-            loss = self.loss_fn(logits, target, reduction = 'none')
+            clipped_loss = loss_fn(logits, clipped_target)
+            loss = loss_fn(logits, target)
 
             value_loss = torch.where(
                 is_between(target, old_values_lo) | is_between(old_values_hi, target),
@@ -448,10 +450,10 @@ class Critic(Module):
                 torch.min(loss, clipped_loss)
             )
         else:
-            clipped_value = old_values + (value - old_values).clamp(1. - eps_clip, 1. + eps_clip)
+            clipped_value = old_values + (value - old_values).clamp(-eps_clip, eps_clip)
 
-            loss = self.loss_fn(logits, target, reduction = 'none')
-            clipped_loss = self.loss_fn(clipped_value, target, reduction = 'none')
+            loss = loss_fn(logits, target)
+            clipped_loss = loss_fn(clipped_value, target)
 
             value_loss = torch.max(loss, clipped_loss)
 
