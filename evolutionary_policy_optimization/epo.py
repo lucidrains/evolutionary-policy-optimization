@@ -76,6 +76,14 @@ def maybe(fn):
 def interface_torch_numpy(fn, device):
     # for a given function, move all inputs from torch tensor to numpy, and all outputs from numpy to torch tensor
 
+    def to_torch_tensor(t):
+        if isinstance(t, (np.ndarray, np.float64)):
+            t = from_numpy(np.array(t))
+        elif isinstance(t, (float, int, bool)):
+            t = tensor(t)
+
+        return t.to(device)
+
     @wraps(fn)
     def decorated_fn(*args, **kwargs):
 
@@ -83,7 +91,7 @@ def interface_torch_numpy(fn, device):
 
         out = fn(*args, **kwargs)
 
-        out = tree_map(lambda t: from_numpy(np.array(t)).to(device) if isinstance(t, (np.ndarray, np.float64)) else t, out)
+        out = tree_map(to_torch_tensor, out)
         return out
 
     return decorated_fn
@@ -285,37 +293,42 @@ class PowerLawDist(Module):
 class MLP(Module):
     def __init__(
         self,
-        dims: tuple[int, ...],
+        dim,
+        depth,
         dim_latent = 0,
+        expansion_factor = 2.
     ):
         super().__init__()
         dim_latent = default(dim_latent, 0)
-
-        assert len(dims) >= 2, 'must have at least two dimensions'
-
-        # add the latent to the first dim
-
-        first_dim, *rest_dims = dims
-        dims = (first_dim + dim_latent, *rest_dims)
 
         self.dim_latent = dim_latent
 
         self.needs_latent = dim_latent > 0
 
         self.encode_latent = nn.Sequential(
-            Linear(dim_latent, dim_latent),
+            Linear(dim_latent, dim),
             nn.SiLU()
         ) if self.needs_latent else None
 
-        # pairs of dimension
+        dim_hidden = int(dim * expansion_factor)
 
-        dim_pairs = tuple(zip(dims[:-1], dims[1:]))
+        # layers
+
+        layers = []
+
+        for _ in range(depth):
+            layer = nn.Sequential(
+                nn.LayerNorm(dim, bias = False),
+                nn.Linear(dim, dim_hidden),
+                nn.SiLU(),
+                nn.Linear(dim_hidden, dim),
+            )
+
+            layers.append(layer)
 
         # modules across layers
 
-        layers = ModuleList([Linear(dim_in, dim_out) for dim_in, dim_out in dim_pairs])
-
-        self.layers = layers
+        self.layers = ModuleList(layers)
 
     def forward(
         self,
@@ -337,17 +350,14 @@ class MLP(Module):
 
             assert latent.shape[0] == x.shape[0], f'received state with batch size {x.shape[0]} but latent ids received had batch size {latent_id.shape[0]}'
 
-            x = cat((x, latent), dim = -1)
+            x = x * latent
 
         # layers
 
         for ind, layer in enumerate(self.layers, start = 1):
             is_last = ind == len(self.layers)
 
-            x = layer(x)
-
-            if not is_last:
-                x = F.silu(x)
+            x = layer(x) + x
 
         return x
 
@@ -359,26 +369,24 @@ class Actor(Module):
         self,
         dim_state,
         num_actions,
-        dim_hiddens: tuple[int, ...],
+        dim,
+        mlp_depth,
         dim_latent = 0,
     ):
         super().__init__()
 
-        assert len(dim_hiddens) >= 2
-        dim_first, *_, dim_last = dim_hiddens
-
         self.dim_latent = dim_latent
 
         self.init_layer = nn.Sequential(
-            nn.Linear(dim_state, dim_first),
+            nn.Linear(dim_state, dim),
             nn.SiLU()
         )
 
-        self.mlp = MLP(dims = dim_hiddens, dim_latent = dim_latent)
+        self.mlp = MLP(dim = dim, depth = mlp_depth, dim_latent = dim_latent)
 
         self.to_out = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(dim_last, num_actions),
+            nn.LayerNorm(dim, bias = False),
+            nn.Linear(dim, num_actions, bias = False),
         )
 
     def forward(
@@ -397,34 +405,31 @@ class Critic(Module):
     def __init__(
         self,
         dim_state,
-        dim_hiddens: tuple[int, ...],
+        dim,
+        mlp_depth,
         dim_latent = 0,
         use_regression = False,
         hl_gauss_loss_kwargs: dict = dict(
-            min_value = -10.,
-            max_value = 10.,
-            num_bins = 25,
-            sigma = 0.5
+            min_value = -100.,
+            max_value = 100.,
+            num_bins = 200
         )
     ):
         super().__init__()
 
-        assert len(dim_hiddens) >= 2
-        dim_first, *_, dim_last = dim_hiddens
-
         self.dim_latent = dim_latent
 
         self.init_layer = nn.Sequential(
-            nn.Linear(dim_state, dim_first),
+            nn.Linear(dim_state, dim),
             nn.SiLU()
         )
 
-        self.mlp = MLP(dims = dim_hiddens, dim_latent = dim_latent)
+        self.mlp = MLP(dim = dim, depth = mlp_depth, dim_latent = dim_latent)
 
-        self.final_act = nn.SiLU()
+        self.final_norm = nn.LayerNorm(dim, bias = False)
 
         self.to_pred = HLGaussLayer(
-            dim = dim_last,
+            dim = dim,
             use_regression = use_regression,
             hl_gauss_loss = hl_gauss_loss_kwargs
         )
@@ -488,7 +493,7 @@ class Critic(Module):
 
         hidden = self.mlp(hidden, latent)
 
-        hidden = self.final_act(hidden)
+        hidden = self.final_norm(hidden)
 
         pred_kwargs = dict(return_logits = return_logits) if not self.use_regression else dict()
         return self.to_pred(hidden, **pred_kwargs)
@@ -843,16 +848,16 @@ class Agent(Module):
         critic: Critic,
         latent_gene_pool: LatentGenePool | None,
         optim_klass = AdoptAtan2,
-        actor_lr = 1e-4,
-        critic_lr = 1e-4,
+        actor_lr = 8e-4,
+        critic_lr = 8e-4,
         latent_lr = 1e-5,
-        actor_weight_decay = 1e-3,
-        critic_weight_decay = 1e-3,
+        actor_weight_decay = 5e-4,
+        critic_weight_decay = 5e-4,
         diversity_aux_loss_weight = 0.,
         use_critic_ema = True,
-        critic_ema_beta = 0.99,
-        max_grad_norm = 0.5,
-        batch_size = 16,
+        critic_ema_beta = 0.95,
+        max_grad_norm = 1.0,
+        batch_size = 32,
         calc_gae_kwargs: dict = dict(
             use_accelerated = False,
             gamma = 0.99,
@@ -1269,8 +1274,10 @@ def create_agent(
     num_latents,
     dim_latent,
     actor_num_actions,
-    actor_dim_hiddens: int | tuple[int, ...],
-    critic_dim_hiddens: int | tuple[int, ...],
+    actor_dim,
+    actor_mlp_depth,
+    critic_dim,
+    critic_mlp_depth,
     use_critic_ema = True,
     latent_gene_pool_kwargs: dict = dict(),
     actor_kwargs: dict = dict(),
@@ -1293,14 +1300,16 @@ def create_agent(
         num_actions = actor_num_actions,
         dim_state = dim_state,
         dim_latent = dim_latent,
-        dim_hiddens = actor_dim_hiddens,
+        dim = actor_dim,
+        mlp_depth = actor_mlp_depth,
         **actor_kwargs
     )
 
     critic = Critic(
         dim_state = dim_state,
         dim_latent = dim_latent,
-        dim_hiddens = critic_dim_hiddens,
+        dim = critic_dim,
+        mlp_depth = critic_mlp_depth,
         **critic_kwargs
     )
 
@@ -1475,7 +1484,7 @@ class EPO(Module):
                     log_prob,
                     reward,
                     value,
-                    tensor(terminated)
+                    terminated
                 )
 
                 memory = Memory(*tuple(t.cpu() for t in memory))
@@ -1487,7 +1496,7 @@ class EPO(Module):
             if not terminated:
                 # add bootstrap value if truncated
 
-                next_value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent)
+                next_value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent, use_ema_if_available = True, use_unwrapped_model = True)
 
                 memory_for_gae = memory._replace(
                     episode_id = invalid_episode,
