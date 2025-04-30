@@ -943,6 +943,8 @@ class Agent(Module):
             eps_clip = 0.4
         ),
         use_improved_critic_loss = True,
+        shrink_and_perturb_every = None,
+        shrink_and_perturb_kwargs: dict = dict(),
         ema_kwargs: dict = dict(),
         actor_optim_kwargs: dict = dict(),
         critic_optim_kwargs: dict = dict(),
@@ -1007,6 +1009,12 @@ class Agent(Module):
 
         self.latent_optim = optim_klass(latent_gene_pool.parameters(), lr = latent_lr, **latent_optim_kwargs) if exists(latent_gene_pool) and not latent_gene_pool.frozen_latents else None
 
+        # shrink and perturb every
+
+        self.should_noise_weights = exists(shrink_and_perturb_every)
+        self.shrink_and_perturb_every = shrink_and_perturb_every
+        self.shrink_and_perturb_ = partial(shrink_and_perturb_, **shrink_and_perturb_kwargs)
+
         # promotes latents to be farther apart for diversity maintenance
 
         self.has_diversity_loss = diversity_aux_loss_weight > 0.
@@ -1016,7 +1024,7 @@ class Agent(Module):
 
         self.unwrap_model = identity if not wrap_with_accelerate else self.accelerate.unwrap_model
 
-        dummy = tensor(0)
+        step = tensor(0)
 
         self.clip_grad_norm_ = nn.utils.clip_grad_norm_
 
@@ -1044,15 +1052,15 @@ class Agent(Module):
             if exists(self.critic_ema):
                 self.critic_ema.to(self.accelerate.device)
 
-            dummy = dummy.to(self.accelerate.device)
+            step = step.to(self.accelerate.device)
 
         # device tracking
 
-        self.register_buffer('dummy', dummy)
+        self.register_buffer('step', step)
 
     @property
     def device(self):
-        return self.dummy.device
+        return self.step.device
 
     @property
     def unwrapped_latent_gene_pool(self):
@@ -1301,6 +1309,16 @@ class Agent(Module):
 
         if self.has_latent_genes:
             self.latent_gene_pool.genetic_algorithm_step(fitness_scores)
+
+        # maybe shrink and perturb
+
+        if self.should_noise_weights and divisible_by(self.step.item(), self.shrink_and_perturb_every):
+            self.shrink_and_perturb_(self.actor)
+            self.shrink_and_perturb_(self.critic)
+
+        # increment step
+
+        self.step.add_(1)
 
 # reinforcement learning related - ppo
 
