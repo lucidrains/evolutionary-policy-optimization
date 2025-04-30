@@ -173,4 +173,13 @@ agent.load('./agent.pt')
 }
 ```
 
+```bibtex
+@inproceedings{Gerasimov2025YouDN,
+    title   = {You Do Not Fully Utilize Transformer's Representation Capacity},
+    author  = {Gleb Gerasimov and Yaroslav Aksenov and Nikita Balagansky and Viacheslav Sinii and Daniil Gavrilov},
+    year    = {2025},
+    url     = {https://api.semanticscholar.org/CorpusID:276317819}
+}
+```
+
 *Evolution is cleverer than you are.* - Leslie Orgel

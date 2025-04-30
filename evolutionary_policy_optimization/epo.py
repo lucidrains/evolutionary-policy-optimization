@@ -287,6 +287,38 @@ class PowerLawDist(Module):
 
         return self.values[sampled]
 
+# layer integrated memory
+
+class DynamicLIMe(Module):
+    def __init__(
+        self,
+        dim,
+        num_layers
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+
+        self.to_weights = nn.Sequential(
+            nn.RMSNorm(dim),
+            nn.Linear(dim, num_layers),
+            nn.ReLU()
+        )
+
+    def forward(
+        self,
+        x,
+        hiddens
+    ):
+
+        if not is_tensor(hiddens):
+            hiddens = stack(hiddens)
+
+        assert hiddens.shape[0] == self.num_layers, f'expected hiddens to have {self.num_layers} layers but received {tuple(hiddens.shape)} instead (first dimension must be layers)'
+
+        weights = self.to_weights(x)
+
+        return einsum(hiddens, weights, 'l b d, b l -> b d')
+
 # simple MLP networks, but with latent variables
 # the latent variables are the "genes" with the rest of the network as the scaffold for "gene expression" - as suggested in the paper
 
@@ -316,15 +348,22 @@ class MLP(Module):
 
         layers = []
 
-        for _ in range(depth):
+        for ind in range(depth):
+            is_first = ind == 0
+
+            lime = DynamicLIMe(dim, num_layers = ind + 1) if not is_first else None
+
             layer = nn.Sequential(
-                nn.LayerNorm(dim, bias = False),
+                nn.RMSNorm(dim),
                 nn.Linear(dim, dim_hidden),
                 nn.SiLU(),
                 nn.Linear(dim_hidden, dim),
             )
 
-            layers.append(layer)
+            layers.append(ModuleList([
+                lime,
+                layer
+            ]))
 
         # modules across layers
 
@@ -354,10 +393,18 @@ class MLP(Module):
 
         # layers
 
-        for ind, layer in enumerate(self.layers, start = 1):
-            is_last = ind == len(self.layers)
+        prev_layer_inputs = [x]
 
-            x = layer(x) + x
+        for lime, layer in self.layers:
+
+            layer_inp = x
+
+            if exists(lime):
+                layer_inp = lime(x, prev_layer_inputs)
+
+            x = layer(layer_inp) + x
+
+            prev_layer_inputs.append(x)
 
         return x
 
@@ -385,7 +432,7 @@ class Actor(Module):
         self.mlp = MLP(dim = dim, depth = mlp_depth, dim_latent = dim_latent)
 
         self.to_out = nn.Sequential(
-            nn.LayerNorm(dim, bias = False),
+            nn.RMSNorm(dim),
             nn.Linear(dim, num_actions, bias = False),
         )
 
@@ -426,7 +473,7 @@ class Critic(Module):
 
         self.mlp = MLP(dim = dim, depth = mlp_depth, dim_latent = dim_latent)
 
-        self.final_norm = nn.LayerNorm(dim, bias = False)
+        self.final_norm = nn.RMSNorm(dim)
 
         self.to_pred = HLGaussLayer(
             dim = dim,
