@@ -21,7 +21,7 @@ env = gym.wrappers.RecordVideo(
     env = env,
     video_folder = './recordings',
     name_prefix = 'lunar-video',
-    episode_trigger = lambda eps_num: (eps_num % 250) == 0,
+    episode_trigger = lambda eps_num: (eps_num % (250 * 4)) == 0,
     disable_logger = True
 )
 
@@ -30,12 +30,12 @@ env = GymnasiumEnvWrapper(env)
 # epo
 
 agent = env.to_epo_agent(
-    num_latents = 1,
+    num_latents = 8,
     dim_latent = 32,
     actor_dim = 128,
-    actor_mlp_depth = 2,
+    actor_mlp_depth = 3,
     critic_dim = 256,
-    critic_mlp_depth = 4,
+    critic_mlp_depth = 5,
     latent_gene_pool_kwargs = dict(
         frac_natural_selected = 0.5,
         frac_tournaments = 0.5
@@ -53,7 +53,7 @@ agent = env.to_epo_agent(
 
 epo = EPO(
     agent,
-    episodes_per_latent = 50,
+    episodes_per_latent = 5,
     max_episode_length = 500,
     action_sample_temperature = 1.,
 )

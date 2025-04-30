@@ -65,8 +65,10 @@ agent = create_agent(
     num_latents = 16,
     dim_latent = 32,
     actor_num_actions = 5,
-    actor_dim_hiddens = (256, 128),
-    critic_dim_hiddens = (256, 128, 64),
+    actor_dim = 256,
+    actor_mlp_depth = 2,
+    critic_dim = 256,
+    critic_mlp_depth = 3,
     latent_gene_pool_kwargs = dict(
         frac_natural_selected = 0.5
     )

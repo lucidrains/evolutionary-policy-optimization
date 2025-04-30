@@ -26,8 +26,8 @@ def test_readme(
 
     state = torch.randn(2, 512)
 
-    actor = Actor(dim_state = 512, dim_hiddens = (256, 128), num_actions = 4, dim_latent = 32)
-    critic = Critic(dim_state = 512, dim_hiddens = (256, 128, 64), dim_latent = 32)
+    actor = Actor(dim_state = 512, dim = 256, mlp_depth = 2, num_actions = 4, dim_latent = 32)
+    critic = Critic(dim_state = 512, dim = 256, mlp_depth = 4, dim_latent = 32)
 
     latent = latent_pool(latent_id = latent_ids, state = state)
 
@@ -55,8 +55,10 @@ def test_create_agent(
         num_latents = 128,
         dim_latent = 32,
         actor_num_actions = 5,
-        actor_dim_hiddens = (256, 128),
-        critic_dim_hiddens = (256, 128, 64)
+        actor_dim = 256,
+        actor_mlp_depth = 2,
+        critic_dim = 256,
+        critic_mlp_depth = 4
     )
 
     state = torch.randn(2, 512)
@@ -98,8 +100,10 @@ def test_e2e_with_mock_env(
         num_latents = num_latents,
         dim_latent = 32,
         actor_num_actions = 5,
-        actor_dim_hiddens = (256, 128),
-        critic_dim_hiddens = (256, 128, 64),
+        actor_dim = 256,
+        actor_mlp_depth = 2,
+        critic_dim = 256,
+        critic_mlp_depth = 4,
         use_critic_ema = use_critic_ema,
         diversity_aux_loss_weight = diversity_aux_loss_weight,
         critic_kwargs = dict(

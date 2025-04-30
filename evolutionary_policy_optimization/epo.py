@@ -76,6 +76,7 @@ def maybe(fn):
 def interface_torch_numpy(fn, device):
     # for a given function, move all inputs from torch tensor to numpy, and all outputs from numpy to torch tensor
 
+    @maybe
     def to_torch_tensor(t):
         if isinstance(t, (np.ndarray, np.float64)):
             t = from_numpy(np.array(t))
@@ -287,6 +288,22 @@ class PowerLawDist(Module):
 
         return self.values[sampled]
 
+# FiLM for latent to mlp conditioning
+
+class FiLM(Module):
+    def __init__(self, dim, dim_out):
+        super().__init__()
+        self.to_gamma = nn.Linear(dim, dim_out, bias = False)
+        self.to_beta = nn.Linear(dim, dim_out, bias = False)
+
+        nn.init.zeros_(self.to_gamma.weight)
+        nn.init.zeros_(self.to_beta.weight)
+
+    def forward(self, x, cond):
+        gamma, beta = self.to_gamma(cond), self.to_beta(cond)
+
+        return x * (gamma + 1.) + beta
+
 # layer integrated memory
 
 class DynamicLIMe(Module):
@@ -301,7 +318,7 @@ class DynamicLIMe(Module):
         self.to_weights = nn.Sequential(
             nn.RMSNorm(dim),
             nn.Linear(dim, num_layers),
-            nn.ReLU()
+            nn.Softmax(dim = -1)
         )
 
     def forward(
@@ -338,7 +355,7 @@ class MLP(Module):
         self.needs_latent = dim_latent > 0
 
         self.encode_latent = nn.Sequential(
-            Linear(dim_latent, dim),
+            Linear(dim_latent, dim * 2),
             nn.SiLU()
         ) if self.needs_latent else None
 
@@ -351,6 +368,11 @@ class MLP(Module):
         for ind in range(depth):
             is_first = ind == 0
 
+            film = None
+
+            if self.needs_latent:
+                film = FiLM(dim * 2, dim)
+
             lime = DynamicLIMe(dim, num_layers = ind + 1) if not is_first else None
 
             layer = nn.Sequential(
@@ -362,6 +384,7 @@ class MLP(Module):
 
             layers.append(ModuleList([
                 lime,
+                film,
                 layer
             ]))
 
@@ -389,18 +412,19 @@ class MLP(Module):
 
             assert latent.shape[0] == x.shape[0], f'received state with batch size {x.shape[0]} but latent ids received had batch size {latent_id.shape[0]}'
 
-            x = x * latent
-
         # layers
 
         prev_layer_inputs = [x]
 
-        for lime, layer in self.layers:
+        for lime, film, layer in self.layers:
 
             layer_inp = x
 
             if exists(lime):
                 layer_inp = lime(x, prev_layer_inputs)
+
+            if exists(film):
+                layer_inp = film(layer_inp, latent)
 
             x = layer(layer_inp) + x
 
