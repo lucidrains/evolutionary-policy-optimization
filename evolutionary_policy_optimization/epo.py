@@ -392,6 +392,8 @@ class MLP(Module):
 
         self.layers = ModuleList(layers)
 
+        self.final_lime = DynamicLIMe(dim, depth + 1)
+
     def forward(
         self,
         x,
@@ -430,7 +432,7 @@ class MLP(Module):
 
             prev_layer_inputs.append(x)
 
-        return x
+        return self.final_lime(x, prev_layer_inputs)
 
 # actor, critic, and agent (actor + critic)
 # eventually, should just create a separate repo and aggregate all the MLP related architectures
