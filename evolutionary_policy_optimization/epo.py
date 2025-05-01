@@ -1068,6 +1068,12 @@ class Agent(Module):
     def unwrapped_latent_gene_pool(self):
         return self.unwrap_model(self.latent_gene_pool)
 
+    def log(self, **data_kwargs):
+        if not self.wrap_with_accelerate:
+            return
+
+        self.accelerate.log(data_kwargs, step = self.step)
+
     def save(self, path, overwrite = False):
         path = Path(path)
 
@@ -1283,6 +1289,14 @@ class Agent(Module):
                 self.critic_optim.step()
                 self.critic_optim.zero_grad()
 
+                # log actor critic loss
+
+                self.log(
+                    actor_loss = actor_loss.item(),
+                    critic_loss = critic_loss.item(),
+                    fitness_scores = fitness_scores
+                )
+
                 # maybe ema update critic
 
                 if self.use_critic_ema:
@@ -1306,6 +1320,11 @@ class Agent(Module):
 
                 self.latent_optim.step()
                 self.latent_optim.zero_grad()
+
+                if self.has_diversity_loss:
+                    self.log(
+                        diversity_loss = diversity_loss.item()
+                    )
 
         # apply evolution
 
