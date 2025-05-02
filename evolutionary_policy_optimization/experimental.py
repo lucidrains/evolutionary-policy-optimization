@@ -1,5 +1,9 @@
 import torch
+import torch.nn.functional as F
 from einops import rearrange
+
+def l2norm(t, dim = -1):
+    return F.normalize(t, dim = dim)
 
 def crossover_weights(w1, w2, transpose = False):
     assert w2.shape == w2.shape
@@ -27,7 +31,7 @@ def crossover_weights(w1, w2, transpose = False):
 
     u = torch.where(mask[:, None, :], u1, u2)
     s = torch.where(mask, s1, s2)
-    v = torch.where(mask[:, None, :], v1, v2)
+    v = torch.where(mask[:, :, None], v1, v2)
 
     out = u @ torch.diag_embed(s) @ v.mT
 
@@ -52,8 +56,12 @@ def mutate_weight(
     assert rank >= 2
 
     u, s, v = torch.svd(w)
+
     u = u + torch.randn_like(u) * mutation_strength
     v = v + torch.randn_like(v) * mutation_strength
+
+    u = l2norm(u, dim = -2)
+    v = l2norm(v, dim = -1)
 
     out = u @ torch.diag_embed(s) @ v.mT
 
