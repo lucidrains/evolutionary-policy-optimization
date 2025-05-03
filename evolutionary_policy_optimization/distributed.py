@@ -61,8 +61,6 @@ def has_only_one_value(t):
     return (t == t[0]).all()
 
 def all_gather_variable_dim(t, dim = 0, sizes = None):
-    device, rank, world_size = t.device, dist.get_rank(), dist.get_world_size()
-
     if not exists(sizes):
         sizes = gather_sizes(t, dim = dim)
 

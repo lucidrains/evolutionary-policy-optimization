@@ -192,7 +192,6 @@ def calc_generalized_advantage_estimate(
     use_accelerated = None
 ):
     use_accelerated = default(use_accelerated, rewards.is_cuda)
-    device = rewards.device
 
     values = F.pad(values, (0, 1), value = 0.)
     values, values_next = values[:-1], values[1:]
@@ -202,7 +201,7 @@ def calc_generalized_advantage_estimate(
 
     scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
 
-    return scan(gates, delta)    
+    return scan(gates, delta)
 
 # evolution related functions
 
@@ -535,7 +534,8 @@ class Critic(Module):
             old_values_lo = old_values - eps_clip
             old_values_hi = old_values + eps_clip
 
-            is_between = lambda lo, hi: (lo < value) & (value < hi)
+            def is_between(lo, hi):
+                return (lo < value) & (value < hi)
 
             clipped_loss = loss_fn(logits, clipped_target)
             loss = loss_fn(logits, target)
@@ -1639,4 +1639,4 @@ class EPO(Module):
 
             agent.learn_from(memories)
 
-        print(f'training complete')
+        print('training complete')

@@ -91,6 +91,22 @@ agent.save('./agent.pt', overwrite = True)
 agent.load('./agent.pt')
 ```
 
+## Contributing
+
+At the project root, run
+
+```bash
+$ pip install '.[test]' # or `uv pip install '.[test]'`
+```
+
+Then add your tests to `tests/test_epo.py` and run
+
+```bash
+$ pytest tests/
+```
+
+That's it
+
 ## Citations
 
 ```bibtex

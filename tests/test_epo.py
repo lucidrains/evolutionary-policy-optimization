@@ -19,7 +19,7 @@ def test_readme(
 
     latent_pool = LatentGenePool(
         num_latents = 128,
-        dim_latent = 32,        
+        dim_latent = 32,
         num_islands = num_islands,
         fast_genetic_algorithm = sampled_mutation_strengths
     )
@@ -31,8 +31,8 @@ def test_readme(
 
     latent = latent_pool(latent_id = latent_ids, state = state)
 
-    actions = actor(state, latent)
-    value = critic(state, latent)
+    actions = actor(state, latent) # noqa: F841
+    value = critic(state, latent) # noqa: F841
 
     # interact with environment and receive rewards, termination etc
 
@@ -63,8 +63,8 @@ def test_create_agent(
 
     state = torch.randn(2, 512)
 
-    actions = agent.get_actor_actions(state, latent_id = latent_ids)
-    value = agent.get_critic_values(state, latent_id = latent_ids)
+    actions = agent.get_actor_actions(state, latent_id = latent_ids) # noqa: F841
+    value = agent.get_critic_values(state, latent_id = latent_ids) # noqa: F841
 
     # interact with environment and receive rewards, termination etc
 

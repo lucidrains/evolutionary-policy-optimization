@@ -1,6 +1,6 @@
 [project]
 name = "evolutionary-policy-optimization"
-version = "0.1.19"
+version = "0.1.20"
 description = "EPO - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -47,12 +47,26 @@ examples = [
 ]
 
 test = [
-    "pytest"
+    "pytest",
+    "ruff>=0.4.2",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = [
   "."
+]
+
+[tool.ruff]
+line-length = 1000
+
+lint.ignore = [
+    "F722", # for jaxtyping shape annotation
+    "F401",
+    "F821"
+]
+
+lint.extend-select = [
+    "W291"
 ]
 
 [build-system]
