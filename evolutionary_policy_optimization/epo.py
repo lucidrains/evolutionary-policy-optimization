@@ -19,7 +19,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from torch.utils._pytree import tree_map
 
 import einx
-from einops import rearrange, repeat, einsum, pack
+from einops import rearrange, repeat, reduce, einsum, pack
 from einops.layers.torch import Rearrange
 
 from evolutionary_policy_optimization.distributed import (
@@ -335,6 +335,53 @@ class DynamicLIMe(Module):
 
         return einsum(hiddens, weights, 'l b d, b l -> b d')
 
+# state normalization
+
+class StateNorm(Module):
+    def __init__(
+        self,
+        dim,
+        eps = 1e-5
+    ):
+        # equation (3) in https://arxiv.org/abs/2410.09754 - 'RSMNorm'
+
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+
+        self.register_buffer('step', tensor(1))
+        self.register_buffer('running_mean', torch.zeros(dim))
+        self.register_buffer('running_variance', torch.ones(dim))
+
+    def forward(
+        self,
+        state
+    ):
+        assert state.shape[-1] == self.dim, f'expected feature dimension of {self.dim} but received {x.shape[-1]}'
+
+        time = self.step.item()
+        mean = self.running_mean
+        variance = self.running_variance
+
+        normed = (state - mean) / variance.sqrt().clamp(min = self.eps)
+
+        if not self.training:
+            return normed
+
+        # update running mean and variance
+
+        new_obs_mean = reduce(state, '... d -> d', 'mean')
+        delta = new_obs_mean - mean
+
+        new_mean = mean + delta / time
+        new_variance = (time - 1) / time * (variance + (delta ** 2) / time)
+
+        self.step.add_(1)
+        self.running_mean.copy_(new_mean)
+        self.running_variance.copy_(new_variance)
+
+        return normed
+
 # simple MLP networks, but with latent variables
 # the latent variables are the "genes" with the rest of the network as the scaffold for "gene expression" - as suggested in the paper
 
@@ -443,9 +490,12 @@ class Actor(Module):
         num_actions,
         dim,
         mlp_depth,
+        state_norm: StateNorm | None = None,
         dim_latent = 0,
     ):
         super().__init__()
+
+        self.state_norm = state_norm
 
         self.dim_latent = dim_latent
 
@@ -466,6 +516,10 @@ class Actor(Module):
         state,
         latent
     ):
+        if exists(self.state_norm):
+            with torch.no_grad():
+                self.state_norm.eval()
+                state = self.state_norm(state)
 
         hidden = self.init_layer(state)
 
@@ -481,6 +535,7 @@ class Critic(Module):
         mlp_depth,
         dim_latent = 0,
         use_regression = False,
+        state_norm: StateNorm | None = None,
         hl_gauss_loss_kwargs: dict = dict(
             min_value = -100.,
             max_value = 100.,
@@ -488,6 +543,8 @@ class Critic(Module):
         )
     ):
         super().__init__()
+
+        self.state_norm = state_norm
 
         self.dim_latent = dim_latent
 
@@ -522,6 +579,12 @@ class Critic(Module):
         eps_clip = 0.4,
         use_improved = True
     ):
+
+        if exists(self.state_norm):
+            with torch.no_grad():
+                self.state_norm.eval()
+                state = self.state_norm(state)
+
         logits = self.forward(state, latent, return_logits = True)
 
         value = self.maybe_bins_to_value(logits)
@@ -921,6 +984,7 @@ class Agent(Module):
         critic: Critic,
         latent_gene_pool: LatentGenePool | None,
         optim_klass = AdoptAtan2,
+        state_norm: StateNorm | None = None,
         actor_lr = 8e-4,
         critic_lr = 8e-4,
         latent_lr = 1e-5,
@@ -965,11 +1029,19 @@ class Agent(Module):
             accelerate = Accelerator(**accelerate_kwargs)
             self.accelerate = accelerate
 
+        # state norm
+
+        self.state_norm = state_norm
+
         # actor, critic, and their shared latent gene pool
 
         self.actor = actor
 
         self.critic = critic
+
+        if exists(state_norm):
+            # insurance
+            actor.state_norm = critic.state_norm = state_norm
 
         self.use_critic_ema = use_critic_ema
         self.critic_ema = EMA(critic, beta = critic_ema_beta, include_online_model = False, **ema_kwargs) if use_critic_ema else None
@@ -1034,6 +1106,7 @@ class Agent(Module):
             self.clip_grad_norm_ = self.accelerate.clip_grad_norm_
 
             (
+                self.state_norm,
                 self.actor,
                 self.critic,
                 self.latent_gene_pool,
@@ -1042,6 +1115,7 @@ class Agent(Module):
                 self.latent_optim,
             ) = tuple(
                 maybe(self.accelerate.prepare)(m) for m in (
+                    self.state_norm,
                     self.actor,
                     self.critic,
                     self.latent_gene_pool,
@@ -1076,31 +1150,34 @@ class Agent(Module):
 
     def save(self, path, overwrite = False):
         path = Path(path)
+        unwrap = self.unwrap_model
 
         assert not path.exists() or overwrite
 
         pkg = dict(
-            actor = self.actor.state_dict(),
-            critic = self.critic.state_dict(),
+            state_norm = unwrap(self.state_norm).state_dict() if self.state_norm else None,
+            actor = unwrap(self.actor).state_dict(),
+            critic = unwrap(self.critic).state_dict(),
             critic_ema = self.critic_ema.state_dict() if self.use_critic_ema else None,
-            latents = self.latent_gene_pool.state_dict() if self.has_latent_genes else None,
-            actor_optim = self.actor_optim.state_dict(),
-            critic_optim = self.critic_optim.state_dict(),
-            latent_optim = self.latent_optim.state_dict() if exists(self.latent_optim) else None
+            latents = unwrap(self.latent_gene_pool).state_dict() if self.has_latent_genes else None,
+            actor_optim = unwrap(self.actor_optim).state_dict(),
+            critic_optim = unwrap(self.critic_optim).state_dict(),
+            latent_optim = unwrap(self.latent_optim).state_dict() if exists(self.latent_optim) else None
         )
 
         torch.save(pkg, str(path))
 
     def load(self, path):
+        unwrap = self.unwrap_model
         path = Path(path)
 
         assert path.exists()
 
         pkg = torch.load(str(path), weights_only = True)
 
-        self.actor.load_state_dict(pkg['actor'])
+        unwrap(self.actor).load_state_dict(pkg['actor'])
 
-        self.critic.load_state_dict(pkg['critic'])
+        unwrap(self.critic).load_state_dict(pkg['critic'])
 
         if self.use_critic_ema:
             self.critic_ema.load_state_dict(pkg['critic_ema'])
@@ -1108,11 +1185,11 @@ class Agent(Module):
         if exists(pkg.get('latents', None)):
             self.latent_gene_pool.load_state_dict(pkg['latents'])
 
-        self.actor_optim.load_state_dict(pkg['actor_optim'])
-        self.critic_optim.load_state_dict(pkg['critic_optim'])
+        unwrap(self.actor_optim).load_state_dict(pkg['actor_optim'])
+        unwrap(self.critic_optim).load_state_dict(pkg['critic_optim'])
 
         if exists(pkg.get('latent_optim', None)):
-            self.latent_optim.load_state_dict(pkg['latent_optim'])
+            unwrap(self.latent_optim).load_state_dict(pkg['latent_optim'])
 
     @move_input_tensors_to_device
     def get_actor_actions(
@@ -1326,6 +1403,14 @@ class Agent(Module):
                         diversity_loss = diversity_loss.item()
                     )
 
+        # update state norm if needed
+
+        if exists(self.state_norm):
+            self.state_norm.train()
+
+            for _, states, *_ in tqdm(dataloader, desc = 'state norm learning'):
+                self.state_norm(states)
+
         # apply evolution
 
         if self.has_latent_genes:
@@ -1406,12 +1491,15 @@ def create_agent(
         **latent_gene_pool_kwargs
     ) if has_latent_genes else None
 
+    state_norm = StateNorm(dim = dim_state)
+
     actor = Actor(
         num_actions = actor_num_actions,
         dim_state = dim_state,
         dim_latent = dim_latent,
         dim = actor_dim,
         mlp_depth = actor_mlp_depth,
+        state_norm = state_norm,
         **actor_kwargs
     )
 
@@ -1420,12 +1508,14 @@ def create_agent(
         dim_latent = dim_latent,
         dim = critic_dim,
         mlp_depth = critic_mlp_depth,
+        state_norm = state_norm,
         **critic_kwargs
     )
 
     agent = Agent(
         actor = actor,
         critic = critic,
+        state_norm = state_norm,
         latent_gene_pool = latent_gene_pool,
         use_critic_ema = use_critic_ema,
         **kwargs

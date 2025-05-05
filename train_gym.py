@@ -21,7 +21,7 @@ env = gym.wrappers.RecordVideo(
     env = env,
     video_folder = './recordings',
     name_prefix = 'lunar-video',
-    episode_trigger = lambda eps_num: (eps_num % (250 * 4)) == 0,
+    episode_trigger = lambda eps_num: (eps_num % 250) == 0,
     disable_logger = True
 )
 
@@ -53,8 +53,8 @@ agent = env.to_epo_agent(
 
 epo = EPO(
     agent,
-    episodes_per_latent = 5,
-    max_episode_length = 500,
+    episodes_per_latent = 10,
+    max_episode_length = 250,
     action_sample_temperature = 1.,
 )
 
