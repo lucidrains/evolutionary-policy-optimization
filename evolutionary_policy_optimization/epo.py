@@ -1044,7 +1044,14 @@ class Agent(Module):
             actor.state_norm = critic.state_norm = state_norm
 
         self.use_critic_ema = use_critic_ema
-        self.critic_ema = EMA(critic, beta = critic_ema_beta, include_online_model = False, **ema_kwargs) if use_critic_ema else None
+
+        self.critic_ema = EMA(
+            critic,
+            beta = critic_ema_beta,
+            include_online_model = False,
+            ignore_startswith_names = {'state_norm'},
+            **ema_kwargs
+        ) if use_critic_ema else None
 
         self.latent_gene_pool = latent_gene_pool
         self.num_latents = latent_gene_pool.num_latents if exists(latent_gene_pool) else 1
