@@ -5,7 +5,7 @@ from einops import rearrange
 def l2norm(t, dim = -1):
     return F.normalize(t, dim = dim)
 
-def crossover_weights(w1, w2, transpose = False):
+def crossover_weights(w1, w2):
     assert w2.shape == w2.shape
 
     no_batch = w1.ndim == 2
@@ -14,6 +14,9 @@ def crossover_weights(w1, w2, transpose = False):
         w1, w2 = tuple(rearrange(t, '... -> 1 ...') for t in (w1, w2))
 
     assert w1.ndim == 3
+
+    i, j = w1.shape[-2:]
+    transpose = i < j
 
     if transpose:
         w1, w2 = tuple(rearrange(t, 'b i j -> b j i') for t in (w1, w2))
@@ -45,14 +48,16 @@ def crossover_weights(w1, w2, transpose = False):
 
 def mutate_weight(
     w,
-    transpose = False,
     mutation_strength = 1.
 ):
+
+    i, j = w.shape[-2:]
+    transpose = i < j
 
     if transpose:
         w = w.transpose(-1, -2)
 
-    rank = min(w2.shape[1:])
+    rank = min(w.shape[1:])
     assert rank >= 2
 
     u, s, v = torch.svd(w)
@@ -71,8 +76,8 @@ def mutate_weight(
     return out
 
 if __name__ == '__main__':
-    w1 = torch.randn(32, 16)
-    w2 = torch.randn(32, 16)
+    w1 = torch.randn(2, 32, 16)
+    w2 = torch.randn(2, 32, 16)
 
     child = crossover_weights(w1, w2)
     mutated_w1 = mutate_weight(w1)

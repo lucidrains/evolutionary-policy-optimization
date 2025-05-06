@@ -1,5 +1,7 @@
+from random import uniform
+
 import torch
-from torch import nn, tensor
+from torch import nn, tensor, randn
 import torch.nn.functional as F
 from torch.func import functional_call, vmap
 from torch.utils.data import Dataset, DataLoader
@@ -9,7 +11,7 @@ import torchvision
 import torchvision.transforms as T
 
 from einops.layers.torch import Rearrange
-from einops import repeat, rearrange
+from einops import repeat, rearrange, reduce, pack, unpack
 
 from evolutionary_policy_optimization.experimental import (
     crossover_weights,
@@ -35,11 +37,13 @@ class MnistDataset(Dataset):
         digit_tensor = T.PILToTensor()(pil)
         return (digit_tensor / 255.).float().to(device), tensor(labels, device = device)
 
+batch = 32
+
 train_dataset = MnistDataset(train = True)
-dl = DataLoader(train_dataset, batch_size = 32, shuffle = True)
+dl = DataLoader(train_dataset, batch_size = batch, shuffle = True, drop_last = True)
 
 eval_dataset = MnistDataset(train = False)
-eval_dl = DataLoader(eval_dataset, batch_size = 32, shuffle = True)
+eval_dl = DataLoader(eval_dataset, batch_size = batch, shuffle = True, drop_last = True)
 
 def cycle(dl):
     while True:
@@ -50,11 +54,9 @@ def cycle(dl):
 
 net = nn.Sequential(
     Rearrange('... c h w -> ... (c h w)'),
-    nn.Linear(784, 128),
+    nn.Linear(784, 64, bias = False),
     nn.ReLU(),
-    nn.Linear(128, 64),
-    nn.ReLU(),
-    nn.Linear(64, 10)
+    nn.Linear(64, 10, bias = False),
 ).to(device)
 
 # regular gradient descent
@@ -90,13 +92,19 @@ for i in range(1000):
             print(f'{i}: eval loss: {eval_loss.item():.3f}')
             print(f'{i}: accuracy: {correct} / {total}')
 
-# genetic algorithm on population of networks
+# periodic crossover from genetic algorithm on population of networks
 # pop stands for population
 
 pop_size = 100
+num_selected = 25
+num_offsprings = pop_size - num_selected
+tournament_size = 5
+learning_rate = 1e-3
 
 params = dict(net.named_parameters())
-pop_params = {name: (torch.randn((pop_size, *param.shape), device = device) * 1e-1) for name, param in params.items()}
+pop_params = {name: (randn((pop_size, *param.shape), device = device) * 0.1).requires_grad_() for name, param in params.items()}
+
+optim = Adam(pop_params.values(), lr = learning_rate)
 
 def forward(params, data):
     return functional_call(net, params, data)
@@ -109,16 +117,71 @@ for i in range(1000):
 
     pop_logits = forward_pop_models(pop_params, data)
 
-    inv_fitnesses = F.cross_entropy(
-        rearrange(pop_logits, 'p b l -> (p b) l'),
-        repeat(labels, 'b -> (p b)', p = pop_size),
+    losses = F.cross_entropy(
+        rearrange(pop_logits, 'p b l -> b l p'),
+        repeat(labels, 'b -> b p', p = pop_size),
         reduction = 'none'
     )
 
-    print(f'{i}: {inv_fitnesses.mean().item():.3f}')
+    losses.sum(dim = -1).mean(dim = 0).backward()
 
-# todo
+    print(f'{i}: loss: {losses.mean().item():.3f}')
 
-# gradient descent and genetic algorithms
+    optim.step()
+    optim.zero_grad()
 
-# todo
+    # evaluate
+
+    if divisible_by(i + 1, 100):
+
+        with torch.no_grad():
+
+            eval_data, labels = next(iter_eval_dl)
+            pop_logits = forward_pop_models(pop_params, eval_data)
+
+            eval_loss = F.cross_entropy(
+                rearrange(pop_logits, 'p b l -> b l p'),
+                repeat(labels, 'b -> b p', p = pop_size),
+                reduction = 'none'
+            )
+
+            total = labels.shape[0] * pop_size
+            correct = (pop_logits.argmax(dim = -1) == labels).long().sum().item()
+
+            print(f'{i}: eval loss: {eval_loss.mean().item():.3f}')
+            print(f'{i}: accuracy: {correct} / {total}')
+
+            # genetic algorithm on population
+
+            fitnesses = 1. / eval_loss
+            
+            fitnesses = reduce(fitnesses, 'b p -> p', 'mean') # average across samples
+
+            # selection
+
+            sel_fitnesses, sel_indices = fitnesses.topk(num_selected, dim = -1)
+
+            sel_parents = {name: (param[sel_indices]) for name, param in pop_params.items()}
+
+            # tournaments
+
+            tourn_ids = randn((num_offsprings, tournament_size)).argsort(dim = -1)
+            tourn_scores = sel_fitnesses[tourn_ids]
+
+            parent_ids = tourn_scores.topk(2, dim = -1).indices
+            parent_ids = rearrange(parent_ids, 'offsprings couple -> couple offsprings')
+
+            # crossover
+
+            for param, sel_parent_param in zip(pop_params.values(), sel_parents.values()):
+                parent1, parent2 = sel_parent_param[parent_ids]
+
+                children = parent1.lerp_(parent2, uniform(0.25, 0.75))
+
+                pop = torch.cat((sel_parent_param, children))
+
+                param.data.copy_(pop).requires_grad_()
+
+            # new optim
+
+            optim = Adam(pop_params.values(), lr = learning_rate)

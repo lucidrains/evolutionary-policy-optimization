@@ -46,6 +46,11 @@ examples = [
     "tqdm",
 ]
 
+experimental = [
+    "tensordict",
+    "torchvision"
+]
+
 test = [
     "pytest",
     "ruff>=0.4.2",
