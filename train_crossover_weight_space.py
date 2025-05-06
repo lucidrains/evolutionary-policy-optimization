@@ -161,26 +161,26 @@ for i in range(1000):
 
             sel_fitnesses, sel_indices = fitnesses.topk(num_selected, dim = -1)
 
-            sel_parents = {name: (param[sel_indices]) for name, param in pop_params.items()}
-
             # tournaments
 
             tourn_ids = randn((num_offsprings, tournament_size)).argsort(dim = -1)
             tourn_scores = sel_fitnesses[tourn_ids]
 
-            parent_ids = tourn_scores.topk(2, dim = -1).indices
-            parent_ids = rearrange(parent_ids, 'offsprings couple -> couple offsprings')
+            winner_ids = tourn_scores.topk(2, dim = -1).indices
+            winner_ids = rearrange(winner_ids, 'offsprings couple -> couple offsprings')
+            parent_ids = sel_indices[winner_ids]
 
             # crossover
 
-            for param, sel_parent_param in zip(pop_params.values(), sel_parents.values()):
-                parent1, parent2 = sel_parent_param[parent_ids]
+            for param in pop_params.values():
+                parents = param[sel_indices]
+                parent1, parent2 = param[parent_ids]
 
                 children = parent1.lerp_(parent2, uniform(0.25, 0.75))
 
-                pop = torch.cat((sel_parent_param, children))
+                pop = torch.cat((parents, children))
 
-                param.data.copy_(pop).requires_grad_()
+                param.data.copy_(pop)
 
             # new optim
 
