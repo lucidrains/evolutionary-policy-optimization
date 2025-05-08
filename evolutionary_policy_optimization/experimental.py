@@ -1,6 +1,14 @@
+from random import uniform
+
 import torch
 import torch.nn.functional as F
-from einops import rearrange
+from torch.func import vmap, functional_call
+from torch.nn import Module, ParameterList
+
+from einops import rearrange, reduce, repeat
+
+def exists(v):
+    return v is not None
 
 def l2norm(t, dim = -1):
     return F.normalize(t, dim = dim)
@@ -74,6 +82,111 @@ def mutate_weight(
         out = out.transpose(-1, -2)
 
     return out
+
+# wrapper that manages network to population
+# able to receive fitness and employ selection + crossover
+
+class PopulationWrapper(Module):
+    def __init__(
+        self,
+        net: Module,
+        pop_size,
+        num_selected,
+        tournament_size,
+        learning_rate = 1e-3,
+        init_std_dev = 1e-1
+    ):
+        super().__init__()
+        assert num_selected < pop_size
+        assert tournament_size < num_selected
+
+        self.num_selected = num_selected
+        self.tournament_size = tournament_size
+        self.num_offsprings = pop_size - num_selected
+
+        self.net = net
+
+        params = dict(net.named_parameters())
+        device = next(iter(params.values())).device
+
+        pop_params = {name: (torch.randn((pop_size, *param.shape), device = device) * init_std_dev).requires_grad_() for name, param in params.items()}
+
+        self.param_names = pop_params.keys()
+        self.param_values = ParameterList(list(pop_params.values()))
+
+        def _forward(params, data):
+            return functional_call(net, params, data)
+
+        self.forward_pop_nets = vmap(_forward, in_dims = (0, None))
+
+    @property
+    def pop_params(self):
+        return dict(zip(self.param_names, self.param_values))
+
+    def parameters(self):
+        return self.pop_params.values()
+
+    def genetic_algorithm_step_(
+        self,
+        fitnesses
+    ):
+        fitnesses = reduce(fitnesses, 'b p -> p', 'mean') # average across samples
+
+        num_selected = self.num_selected
+
+        # selection
+
+        sel_fitnesses, sel_indices = fitnesses.topk(num_selected, dim = -1)
+
+        # tournaments
+
+        tourn_ids = torch.randn((self.num_offsprings, self.tournament_size)).argsort(dim = -1)
+        tourn_scores = sel_fitnesses[tourn_ids]
+
+        winner_ids = tourn_scores.topk(2, dim = -1).indices
+        winner_ids = rearrange(winner_ids, 'offsprings couple -> couple offsprings')
+        parent_ids = sel_indices[winner_ids]
+
+        # crossover
+
+        for param in self.param_values:
+            parents = param[sel_indices]
+            parent1, parent2 = param[parent_ids]
+
+            children = parent1.lerp_(parent2, uniform(0.25, 0.75))
+
+            pop = torch.cat((parents, children))
+
+            param.data.copy_(pop)
+
+    def forward(
+        self,
+        data,
+        labels = None,
+        return_logits_with_loss = False
+    ):
+        out = self.forward_pop_nets(dict(self.pop_params), data)
+
+        if not exists(labels):
+            return out
+
+        logits = out
+        pop_size = logits.shape[0]
+
+        losses = F.cross_entropy(
+            rearrange(logits, 'p b ... l -> (p b) l ...'),
+            repeat(labels, 'b ... -> (p b) ...', p = pop_size),
+            reduction = 'none'
+        )
+
+        losses = rearrange(losses, '(p b) ... -> p b ...', p = pop_size)
+
+        if not return_logits_with_loss:
+            return losses
+
+        return losses, logits
+
+# test
 
 if __name__ == '__main__':
     w1 = torch.randn(2, 32, 16)

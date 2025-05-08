@@ -3,7 +3,6 @@ from random import uniform
 import torch
 from torch import nn, tensor, randn
 import torch.nn.functional as F
-from torch.func import functional_call, vmap
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import Adam
 
@@ -11,12 +10,9 @@ import torchvision
 import torchvision.transforms as T
 
 from einops.layers.torch import Rearrange
-from einops import repeat, rearrange, reduce, pack, unpack
+from einops import repeat, rearrange
 
-from evolutionary_policy_optimization.experimental import (
-    crossover_weights,
-    mutate_weight
-)
+from evolutionary_policy_optimization.experimental import PopulationWrapper
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -96,34 +92,26 @@ for i in range(1000):
 # pop stands for population
 
 pop_size = 100
-num_selected = 25
-num_offsprings = pop_size - num_selected
-tournament_size = 5
-learning_rate = 1e-3
+learning_rate = 3e-4
 
-params = dict(net.named_parameters())
-pop_params = {name: (randn((pop_size, *param.shape), device = device) * 0.1).requires_grad_() for name, param in params.items()}
+pop_net = PopulationWrapper(
+    net,
+    pop_size = pop_size,
+    num_selected = 25,
+    tournament_size = 5,
+    learning_rate = 1e-3
+)
 
-optim = Adam(pop_params.values(), lr = learning_rate)
-
-def forward(params, data):
-    return functional_call(net, params, data)
-
-forward_pop_models = vmap(forward, in_dims = (0, None))
+optim = Adam(pop_net.parameters(), lr = learning_rate)
 
 for i in range(1000):
+    pop_net.train()
 
     data, labels = next(iter_train_dl)
 
-    pop_logits = forward_pop_models(pop_params, data)
+    losses = pop_net(data, labels)
 
-    losses = F.cross_entropy(
-        rearrange(pop_logits, 'p b l -> b l p'),
-        repeat(labels, 'b -> b p', p = pop_size),
-        reduction = 'none'
-    )
-
-    losses.sum(dim = -1).mean(dim = 0).backward()
+    losses.sum(dim = 0).mean().backward()
 
     print(f'{i}: loss: {losses.mean().item():.3f}')
 
@@ -136,17 +124,13 @@ for i in range(1000):
 
         with torch.no_grad():
 
-            eval_data, labels = next(iter_eval_dl)
-            pop_logits = forward_pop_models(pop_params, eval_data)
+            pop_net.eval()
 
-            eval_loss = F.cross_entropy(
-                rearrange(pop_logits, 'p b l -> b l p'),
-                repeat(labels, 'b -> b p', p = pop_size),
-                reduction = 'none'
-            )
+            eval_data, labels = next(iter_eval_dl)
+            eval_loss, logits = pop_net(eval_data, labels, return_logits_with_loss = True)
 
             total = labels.shape[0] * pop_size
-            correct = (pop_logits.argmax(dim = -1) == labels).long().sum().item()
+            correct = (logits.argmax(dim = -1) == labels).long().sum().item()
 
             print(f'{i}: eval loss: {eval_loss.mean().item():.3f}')
             print(f'{i}: accuracy: {correct} / {total}')
@@ -154,34 +138,9 @@ for i in range(1000):
             # genetic algorithm on population
 
             fitnesses = 1. / eval_loss
+
+            pop_net.genetic_algorithm_step_(fitnesses)
             
-            fitnesses = reduce(fitnesses, 'b p -> p', 'mean') # average across samples
-
-            # selection
-
-            sel_fitnesses, sel_indices = fitnesses.topk(num_selected, dim = -1)
-
-            # tournaments
-
-            tourn_ids = randn((num_offsprings, tournament_size)).argsort(dim = -1)
-            tourn_scores = sel_fitnesses[tourn_ids]
-
-            winner_ids = tourn_scores.topk(2, dim = -1).indices
-            winner_ids = rearrange(winner_ids, 'offsprings couple -> couple offsprings')
-            parent_ids = sel_indices[winner_ids]
-
-            # crossover
-
-            for param in pop_params.values():
-                parents = param[sel_indices]
-                parent1, parent2 = param[parent_ids]
-
-                children = parent1.lerp_(parent2, uniform(0.25, 0.75))
-
-                pop = torch.cat((parents, children))
-
-                param.data.copy_(pop)
-
             # new optim
 
-            optim = Adam(pop_params.values(), lr = learning_rate)
+            optim = Adam(pop_net.parameters(), lr = learning_rate)
