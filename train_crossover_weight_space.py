@@ -109,7 +109,7 @@ for i in range(1000):
 
     data, labels = next(iter_train_dl)
 
-    losses = pop_net(data, labels)
+    losses = pop_net(data, labels = labels)
 
     losses.sum(dim = 0).mean().backward()
 
@@ -127,7 +127,7 @@ for i in range(1000):
             pop_net.eval()
 
             eval_data, labels = next(iter_eval_dl)
-            eval_loss, logits = pop_net(eval_data, labels, return_logits_with_loss = True)
+            eval_loss, logits = pop_net(eval_data, labels = labels, return_logits_with_loss = True)
 
             total = labels.shape[0] * pop_size
             correct = (logits.argmax(dim = -1) == labels).long().sum().item()

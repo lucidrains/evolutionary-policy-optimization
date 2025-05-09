@@ -1,4 +1,5 @@
 from random import uniform
+from copy import deepcopy
 
 import torch
 import torch.nn.functional as F
@@ -100,6 +101,7 @@ class PopulationWrapper(Module):
         assert num_selected < pop_size
         assert tournament_size < num_selected
 
+        self.pop_size = pop_size
         self.num_selected = num_selected
         self.tournament_size = tournament_size
         self.num_offsprings = pop_size - num_selected
@@ -122,6 +124,14 @@ class PopulationWrapper(Module):
     @property
     def pop_params(self):
         return dict(zip(self.param_names, self.param_values))
+
+    def individual(self, id) -> Module:
+        assert 0 <= id < self.pop_size
+        state_dict = {key: param[id] for key, param in self.pop_params.items()}
+
+        net = deepcopy(self.net)
+        net.load_state_dict(state_dict)
+        return net
 
     def parameters(self):
         return self.pop_params.values()
@@ -162,9 +172,18 @@ class PopulationWrapper(Module):
     def forward(
         self,
         data,
+        *,
+        individual_id = None,
         labels = None,
         return_logits_with_loss = False
     ):
+        # if `individual_id` passed in, will forward for only that one network
+
+        if exists(individual_id):
+            assert 0 <= individual_id < self.pop_size
+            params = {key: param[individual_id] for key, param in self.pop_params.items()}
+            return functional_call(self.net, params, data)
+
         out = self.forward_pop_nets(dict(self.pop_params), data)
 
         if not exists(labels):
