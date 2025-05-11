@@ -211,4 +211,14 @@ That's it
 }
 ```
 
+```bibtex
+@article{Karras2019stylegan2,
+    title   = {Analyzing and Improving the Image Quality of {StyleGAN}},
+    author  = {Tero Karras and Samuli Laine and Miika Aittala and Janne Hellsten and Jaakko Lehtinen and Timo Aila},
+    journal = {CoRR},
+    volume  = {abs/1912.04958},
+    year    = {2019},
+}
+```
+
 *Evolution is cleverer than you are.* - Leslie Orgel

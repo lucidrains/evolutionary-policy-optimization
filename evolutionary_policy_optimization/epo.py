@@ -382,6 +382,53 @@ class StateNorm(Module):
 
         return normed
 
+# style mapping network from StyleGAN2
+# https://arxiv.org/abs/1912.04958
+
+class EqualLinear(Module):
+    def __init__(
+        self,
+        dim_in,
+        dim_out,
+        lr_mul = 1,
+        bias = True
+    ):
+        super().__init__()
+        self.lr_mul = lr_mul
+
+        self.weight = nn.Parameter(torch.randn(dim_out, dim_in))
+        self.bias = nn.Parameter(torch.zeros(dim_out))
+
+    def forward(
+        self,
+        input
+    ):
+        weight, bias = tuple(t * self.lr_mul for t in (self.weight, self.bias))
+        return F.linear(input, weight, bias = bias)
+
+class LatentMappingNetwork(Module):
+    def __init__(
+        self,
+        dim_latent,
+        depth,
+        lr_mul = 0.1,
+        leaky_relu_p = 2e-2
+    ):
+        super().__init__()
+
+        layers = []
+
+        for i in range(depth):
+            layers.extend([
+                EqualLinear(dim_latent, dim_latent, lr_mul),
+                nn.LeakyReLU(leaky_relu_p)
+            ])
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
 # simple MLP networks, but with latent variables
 # the latent variables are the "genes" with the rest of the network as the scaffold for "gene expression" - as suggested in the paper
 
@@ -391,6 +438,7 @@ class MLP(Module):
         dim,
         depth,
         dim_latent = 0,
+        latent_mapping_network_depth = 2,
         expansion_factor = 2.
     ):
         super().__init__()
@@ -401,6 +449,7 @@ class MLP(Module):
         self.needs_latent = dim_latent > 0
 
         self.encode_latent = nn.Sequential(
+            LatentMappingNetwork(dim_latent, depth = latent_mapping_network_depth),
             Linear(dim_latent, dim * 2),
             nn.SiLU()
         ) if self.needs_latent else None
