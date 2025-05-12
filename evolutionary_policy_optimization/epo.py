@@ -167,6 +167,8 @@ def shrink_and_perturb_(
 
     assert 0. <= shrink_factor <= 1.
 
+    maybe_sync_seed()
+
     for p in module.parameters():
         noise = torch.randn_like(p.data)
         p.data.mul_(1. - shrink_factor).add_(noise * perturb_factor)
@@ -852,6 +854,8 @@ class LatentGenePool(Module):
         inplace = True,
         migrate = None # trigger a migration in the setting of multiple islands, the loop outside will need to have some `migrate_every` hyperparameter
     ):
+        maybe_sync_seed()
+
         device = self.latents.device
 
         if not divisible_by(self.step.item(), self.apply_genetic_algorithm_every):
