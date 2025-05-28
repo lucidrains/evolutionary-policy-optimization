@@ -58,7 +58,8 @@ def test_create_agent(
         actor_dim = 256,
         actor_mlp_depth = 2,
         critic_dim = 256,
-        critic_mlp_depth = 4
+        critic_mlp_depth = 4,
+        wrap_with_accelerate = False
     )
 
     state = torch.randn(2, 512)
