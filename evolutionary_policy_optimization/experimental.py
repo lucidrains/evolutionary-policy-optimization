@@ -2,6 +2,7 @@ from random import uniform
 from copy import deepcopy
 
 import torch
+from torch import Tensor
 import torch.nn.functional as F
 from torch.func import vmap, functional_call
 from torch.nn import Module, ParameterList
@@ -14,7 +15,26 @@ def exists(v):
 def l2norm(t, dim = -1):
     return F.normalize(t, dim = dim)
 
-def crossover_weights(w1, w2):
+def shrink_and_perturb_(
+    t: Tensor,
+    shrink_factor = 0.4,
+    perturb_factor = 0.1
+):
+    # Shrink & Perturb
+    # Ash et al. https://arxiv.org/abs/1910.08475
+    # Applied to PBT NAS here https://arxiv.org/abs/2307.15621 - (0.4, 0.1)
+
+    assert 0. <= shrink_factor <= 1.
+    noise = torch.randn_like(t)
+    t.mul_(1. - shrink_factor).add_(noise * perturb_factor)
+    return t
+
+def crossover_weights(
+    w1, w2,
+    shrink_perturb = False,
+    shrink_factor = 0.4,
+    perturb_factor = 0.1
+):
     assert w2.shape == w2.shape
 
     no_batch = w1.ndim == 2
@@ -52,6 +72,9 @@ def crossover_weights(w1, w2):
 
     if no_batch:
         out = rearrange(out, '1 ... -> ...')
+
+    if shrink_perturb:
+        shrink_and_perturb_(out, shrink_factor = shrink_factor, perturb_factor = perturb_factor)
 
     return out
 

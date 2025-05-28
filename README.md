@@ -221,4 +221,15 @@ That's it
 }
 ```
 
+```bibtex
+@article{Chebykin2023ShrinkPerturbIA,
+    title   = {Shrink-Perturb Improves Architecture Mixing during Population Based Training for Neural Architecture Search},
+    author  = {Alexander Chebykin and Arkadiy Dushatskiy and Tanja Alderliesten and Peter A. N. Bosman},
+    journal = {ArXiv},
+    year    = {2023},
+    volume  = {abs/2307.15621},
+    url     = {https://api.semanticscholar.org/CorpusID:260316291}
+}
+```
+
 *Evolution is cleverer than you are.* - Leslie Orgel
