@@ -61,6 +61,8 @@ def has_only_one_value(t):
     return (t == t[0]).all()
 
 def all_gather_variable_dim(t, dim = 0, sizes = None):
+    device = t.device
+
     if not exists(sizes):
         sizes = gather_sizes(t, dim = dim)
 
@@ -77,7 +79,7 @@ def all_gather_variable_dim(t, dim = 0, sizes = None):
     gathered_tensors = torch.cat(gathered_tensors, dim = dim)
     seq = torch.arange(max_size, device = device)
 
-    mask = einx.less('j i -> (i j)', seq, sizes)
+    mask = einx.less('j, i -> (i j)', seq, sizes)
     seq = torch.arange(mask.shape[-1], device = device)
     indices = seq[mask]
 
