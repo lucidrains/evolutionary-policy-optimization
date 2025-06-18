@@ -30,10 +30,10 @@ latent_pool = LatentGenePool(
     dim_latent = 32,
 )
 
-state = torch.randn(1, 512)
+state = torch.randn(1, 32)
 
-actor = Actor(512, dim_hiddens = (256, 128), num_actions = 4, dim_latent = 32)
-critic = Critic(512, dim_hiddens = (256, 128, 64), dim_latent = 32)
+actor = Actor(dim_state = 32, dim = 256, mlp_depth = 2, num_actions = 4, dim_latent = 32)
+critic = Critic(dim_state = 32, dim = 256, mlp_depth = 3, dim_latent = 32)
 
 latent = latent_pool(latent_id = 2)
 
