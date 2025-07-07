@@ -232,4 +232,15 @@ That's it
 }
 ```
 
+```bibtex
+@article{Jiang2022GeneralIR,
+    title     = {General intelligence requires rethinking exploration},
+    author    = {Minqi Jiang and Tim Rocktaschel and Edward Grefenstette},
+    journal   = {Royal Society Open Science},
+    year      = {2022},
+    volume    = {10},
+    url       = {https://api.semanticscholar.org/CorpusID:253523156}
+}
+```
+
 *Evolution is cleverer than you are.* - Leslie Orgel
