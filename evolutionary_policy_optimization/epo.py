@@ -644,10 +644,10 @@ class Critic(Module):
         loss_fn = partial(self.loss_fn, reduction = 'none')
 
         if use_improved:
-            clipped_target = target.clamp(-eps_clip, eps_clip)
-
             old_values_lo = old_values - eps_clip
             old_values_hi = old_values + eps_clip
+
+            clipped_target = target.clamp(old_values_lo, old_values_hi)
 
             def is_between(lo, hi):
                 return (lo < value) & (value < hi)
