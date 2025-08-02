@@ -589,9 +589,9 @@ class Critic(Module):
         use_regression = False,
         state_norm: StateNorm | None = None,
         hl_gauss_loss_kwargs: dict = dict(
-            min_value = -100.,
-            max_value = 100.,
-            num_bins = 200
+            min_value = -10.,
+            max_value = 10.,
+            num_bins = 250
         )
     ):
         super().__init__()
