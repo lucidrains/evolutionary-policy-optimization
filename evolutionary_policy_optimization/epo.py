@@ -1063,6 +1063,7 @@ class Agent(Module):
         critic_loss_kwargs: dict = dict(
             eps_clip = 0.4
         ),
+        use_spo = False, # Simple Policy Optimization - Xie et al. https://arxiv.org/abs/2401.16025v9
         use_improved_critic_loss = True,
         shrink_and_perturb_every = None,
         shrink_and_perturb_kwargs: dict = dict(),
@@ -1126,6 +1127,7 @@ class Agent(Module):
         self.actor_loss = partial(actor_loss, **actor_loss_kwargs)
         self.critic_loss_kwargs = critic_loss_kwargs
 
+        self.use_spo = use_spo
         self.use_improved_critic_loss = use_improved_critic_loss
 
         # fitness score related
@@ -1399,7 +1401,7 @@ class Agent(Module):
 
                 logits = self.actor(states, latents)
 
-                actor_loss = self.actor_loss(logits, log_probs, actions, advantages)
+                actor_loss = self.actor_loss(logits, log_probs, actions, advantages, use_spo = self.use_spo)
 
                 actor_loss.backward()
 
@@ -1498,7 +1500,8 @@ def actor_loss(
     eps_clip = 0.2,
     entropy_weight = .01,
     eps = 1e-5,
-    norm_advantages = True
+    norm_advantages = True,
+    use_spo = False
 ):
     batch = logits.shape[0]
 
@@ -1506,14 +1509,22 @@ def actor_loss(
 
     ratio = (log_probs - old_log_probs).exp()
 
-    # classic clipped surrogate loss from ppo
-
-    clipped_ratio = ratio.clamp(min = 1. - eps_clip, max = 1. + eps_clip)
-
     if norm_advantages:
         advantages = F.layer_norm(advantages, (batch,), eps = eps)
 
-    actor_loss = -torch.min(clipped_ratio * advantages, ratio * advantages)
+    if use_spo:
+        # simple policy optimization - line 14 Algorithm 1 https://arxiv.org/abs/2401.16025v9
+
+        actor_loss = - (
+            ratio * advantages -
+            advantages.abs() / (2 * eps_clip) * (ratio - 1.).square()
+        )
+    else:
+        # classic clipped surrogate loss from ppo
+
+        clipped_ratio = ratio.clamp(min = 1. - eps_clip, max = 1. + eps_clip)
+
+        actor_loss = -torch.min(clipped_ratio * advantages, ratio * advantages)
 
     # add entropy loss for exploration
 

@@ -45,8 +45,10 @@ def test_readme(
     latent_pool.firefly_step(fitness)
 
 @pytest.mark.parametrize('latent_ids', (2, (2, 4)))
+@pytest.mark.parametrize('use_spo', (False, True))
 def test_create_agent(
-    latent_ids
+    latent_ids,
+    use_spo
 ):
     from evolutionary_policy_optimization import create_agent
 
@@ -59,7 +61,8 @@ def test_create_agent(
         actor_mlp_depth = 2,
         critic_dim = 256,
         critic_mlp_depth = 4,
-        wrap_with_accelerate = False
+        wrap_with_accelerate = False,
+        use_spo = use_spo
     )
 
     state = torch.randn(2, 512)

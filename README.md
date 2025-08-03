@@ -243,4 +243,16 @@ That's it
 }
 ```
 
+```bibtex
+@misc{xie2025simplepolicyoptimization,
+    title   = {Simple Policy Optimization}, 
+    author  = {Zhengpeng Xie and Qiang Zhang and Fan Yang and Marco Hutter and Renjing Xu},
+    year    = {2025},
+    eprint  = {2401.16025},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url = {https://arxiv.org/abs/2401.16025}, 
+}
+```
+
 *Evolution is cleverer than you are.* - Leslie Orgel
