@@ -255,4 +255,14 @@ That's it
 }
 ```
 
+```bibtex
+@inproceedings{Nisioti2025WhenDN,
+    title   = {When Does Neuroevolution Outcompete Reinforcement Learning in Transfer Learning Tasks?},
+    author  = {Eleni Nisioti and Joachim Winther Pedersen and Erwan Plantec and Milton L. Montero and Sebastian Risi},
+    booktitle = {Annual Conference on Genetic and Evolutionary Computation},
+    year    = {2025},
+    url     = {https://api.semanticscholar.org/CorpusID:278995766}
+}
+```
+
 *Evolution is cleverer than you are.* - Leslie Orgel
