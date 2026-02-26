@@ -1,6 +1,6 @@
 [project]
 name = "evolutionary-policy-optimization"
-version = "0.2.15"
+version = "0.2.16"
 description = "EPO - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -78,8 +78,12 @@ lint.extend-select = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.metadata]
-allow-direct-references = true
+[tool.hatch.build]
+include = [
+  "evolutionary_policy_optimization",
+  "LICENSE",
+  "README.md",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["evolutionary_policy_optimization"]

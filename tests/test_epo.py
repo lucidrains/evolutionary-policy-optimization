@@ -11,15 +11,18 @@ from evolutionary_policy_optimization.epo import (
 @pytest.mark.parametrize('latent_ids', (2, (2, 4)))
 @pytest.mark.parametrize('num_islands', (1, 4))
 @pytest.mark.parametrize('sampled_mutation_strengths', (False, True))
+@pytest.mark.parametrize('l2norm_latent', (False, True))
 def test_readme(
     latent_ids,
     num_islands,
-    sampled_mutation_strengths
+    sampled_mutation_strengths,
+    l2norm_latent
 ):
 
     latent_pool = LatentGenePool(
         num_latents = 128,
         dim_latent = 32,
+        l2norm_latent = l2norm_latent,
         num_islands = num_islands,
         fast_genetic_algorithm = sampled_mutation_strengths
     )

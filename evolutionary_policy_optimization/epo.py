@@ -50,7 +50,7 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
-def identity(t):
+def identity(t, *args, **kwargs):
     return t
 
 def xnor(x, y):
@@ -109,8 +109,8 @@ def move_input_tensors_to_device(fn):
 
 # tensor helpers
 
-def l2norm(t):
-    return F.normalize(t, p = 2, dim = -1)
+def l2norm(t, dim = -1):
+    return F.normalize(t, p = 2, dim = dim)
 
 def batch_randperm(shape, device):
     return torch.randn(shape, device = device).argsort(dim = -1)
