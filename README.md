@@ -281,6 +281,8 @@ That's it
 ```bibtex
 @misc{kedia2026simtoolrealobjectcentricpolicyzeroshot,
     title   = {SimToolReal: An Object-Centric Policy for Zero-Shot Dexterous Tool Manipulation},
+@misc{kedia2026simtoolrealobjectcentricpolicyzeroshot,
+    title   = {SimToolReal: An Object-Centric Policy for Zero-Shot Dexterous Tool Manipulation}, 
     author  = {Kushal Kedia and Tyler Ga Wei Lum and Jeannette Bohg and C. Karen Liu},
     year    = {2026},
     eprint  = {2602.16863},
@@ -298,6 +300,7 @@ That's it
     year    = {2018},
     volume  = {abs/1802.06070},
     url     = {https://arxiv.org/abs/1802.06070}
+    url     = {https://arxiv.org/abs/2602.16863}, 
 }
 ```
 
