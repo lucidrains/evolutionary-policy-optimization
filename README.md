@@ -276,8 +276,18 @@ That's it
     article-number = {453},
     url            = {https://www.mdpi.com/2079-8954/13/6/453},
     issn           = {2079-8954}
+```
+
+```bibtex
+@misc{kedia2026simtoolrealobjectcentricpolicyzeroshot,
+    title   = {SimToolReal: An Object-Centric Policy for Zero-Shot Dexterous Tool Manipulation}, 
+    author  = {Kushal Kedia and Tyler Ga Wei Lum and Jeannette Bohg and C. Karen Liu},
+    year    = {2026},
+    eprint  = {2602.16863},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url     = {https://arxiv.org/abs/2602.16863}, 
 }
 ```
 
 *Evolution is cleverer than you are.* - Leslie Orgel
-
