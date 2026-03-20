@@ -22,6 +22,8 @@ import einx
 from einops import rearrange, repeat, reduce, einsum, pack
 from einops.layers.torch import Rearrange
 
+from x_mlps_pytorch import AttnResidualNormedMLP
+
 from evolutionary_policy_optimization.distributed import (
     is_distributed,
     get_world_and_rank,
@@ -532,6 +534,38 @@ class MLP(Module):
 
         return self.final_lime(x, prev_layer_inputs)
 
+# discriminator for predicting latent code from states and actions (DIAYN - Eysenbach et al. 2018)
+
+class DiversityDiscr(Module):
+    def __init__(
+        self,
+        dim_state,
+        num_actions,
+        num_latents,
+        dim = 64,
+        depth = 2
+    ):
+        super().__init__()
+        self.action_embed = nn.Embedding(num_actions, dim)
+        self.state_proj = nn.Linear(dim_state, dim)
+
+        self.net = AttnResidualNormedMLP(
+            dim = dim,
+            depth = depth,
+            dim_in = dim * 2,
+            dim_out = num_latents
+        )
+
+    def reset_parameters(self):
+        for module in self.modules():
+            if isinstance(module, (nn.Linear, nn.LayerNorm, nn.RMSNorm, nn.Embedding)):
+                module.reset_parameters()
+
+    def forward(self, state, action):
+        state_embed = self.state_proj(state)
+        action_embed = self.action_embed(action)
+        return self.net((state_embed, action_embed))
+
 # actor, critic, and agent (actor + critic)
 # eventually, should just create a separate repo and aggregate all the MLP related architectures
 
@@ -862,7 +896,11 @@ class LatentGenePool(Module):
 
         if not divisible_by(self.step.item(), self.apply_genetic_algorithm_every):
             self.advance_step_()
-            return
+
+            if inplace:
+                return False, None
+
+            return False, self.latents
 
         """
         i - islands
@@ -894,9 +932,9 @@ class LatentGenePool(Module):
 
         if not should_update_per_island.any():
             if inplace:
-                return
+                return False, None
 
-            return genes
+            return False, genes
 
         genes = rearrange(genes, '(i p) ... -> i p ...', i = islands)
 
@@ -982,14 +1020,19 @@ class LatentGenePool(Module):
 
         genes = rearrange(genes, 'i p ... -> (i p) ...')
 
+        ret = (True, genes)
+
         if not inplace:
-            return genes
+            return ret
 
         # store the genes for the next interaction with environment for new fitness values (a function of reward and other to be researched measures)
 
         self.latents.copy_(genes)
 
         self.advance_step_()
+
+        if inplace:
+            return ret
 
     def forward(
         self,
@@ -1071,6 +1114,10 @@ class Agent(Module):
         actor_optim_kwargs: dict = dict(),
         critic_optim_kwargs: dict = dict(),
         latent_optim_kwargs: dict = dict(),
+        use_diversity_discr = False,
+        diversity_discr_kwargs: dict = dict(dim = 64, depth = 2),
+        diversity_discr_lr = 3e-4,
+        diversity_discr_optim_kwargs: dict = dict(),
         get_fitness_scores: Callable[..., Tensor] = get_fitness_scores,
         wrap_with_accelerate: bool = True,
         accelerate_kwargs: dict = dict(),
@@ -1147,6 +1194,30 @@ class Agent(Module):
 
         self.latent_optim = optim_klass(latent_gene_pool.parameters(), lr = latent_lr, **latent_optim_kwargs) if exists(latent_gene_pool) and not latent_gene_pool.frozen_latents else None
 
+        # diversity discriminator
+
+        self.use_diversity_discr = use_diversity_discr
+
+        if use_diversity_discr:
+            assert exists(latent_gene_pool), 'latent_gene_pool must be present to use DIAYN'
+            dim_state = actor.init_layer[0].in_features
+            num_actions = actor.to_out[1].out_features
+
+            self.diversity_discr = DiversityDiscr(
+                dim_state = dim_state,
+                num_actions = num_actions,
+                num_latents = latent_gene_pool.num_latents,
+                **diversity_discr_kwargs
+            )
+
+            self.diversity_discr_optim = optim_klass(self.diversity_discr.parameters(), lr = diversity_discr_lr, **diversity_discr_optim_kwargs)
+        else:
+            self.diversity_discr = None
+            self.diversity_discr_optim = None
+
+        self.register_buffer('has_diversity_discr_warmed_up', tensor(False))
+        self.register_buffer('zero', tensor(0.))
+
         # shrink and perturb every
 
         self.should_noise_weights = exists(shrink_and_perturb_every)
@@ -1174,18 +1245,22 @@ class Agent(Module):
                 self.actor,
                 self.critic,
                 self.latent_gene_pool,
+                self.diversity_discr,
                 self.actor_optim,
                 self.critic_optim,
                 self.latent_optim,
+                self.diversity_discr_optim,
             ) = tuple(
                 maybe(self.accelerate.prepare)(m) for m in (
                     self.state_norm,
                     self.actor,
                     self.critic,
                     self.latent_gene_pool,
+                    self.diversity_discr,
                     self.actor_optim,
                     self.critic_optim,
                     self.latent_optim,
+                    self.diversity_discr_optim,
                 )
             )
 
@@ -1215,24 +1290,28 @@ class Agent(Module):
     def save(self, path, overwrite = False):
         path = Path(path)
         unwrap = self.unwrap_model
+        unwrap_optim = lambda opt: opt.optimizer if hasattr(opt, 'optimizer') else opt
 
         assert not path.exists() or overwrite
 
         pkg = dict(
-            state_norm = unwrap(self.state_norm).state_dict() if self.state_norm else None,
             actor = unwrap(self.actor).state_dict(),
             critic = unwrap(self.critic).state_dict(),
             critic_ema = self.critic_ema.state_dict() if self.use_critic_ema else None,
             latents = unwrap(self.latent_gene_pool).state_dict() if self.has_latent_genes else None,
-            actor_optim = unwrap(self.actor_optim).state_dict(),
-            critic_optim = unwrap(self.critic_optim).state_dict(),
-            latent_optim = unwrap(self.latent_optim).state_dict() if exists(self.latent_optim) else None
+            diversity_discr = unwrap(self.diversity_discr).state_dict() if self.use_diversity_discr else None,
+            has_diversity_discr_warmed_up = self.has_diversity_discr_warmed_up.item(),
+            actor_optim = unwrap_optim(self.actor_optim).state_dict(),
+            critic_optim = unwrap_optim(self.critic_optim).state_dict(),
+            latent_optim = unwrap_optim(self.latent_optim).state_dict() if exists(self.latent_optim) else None,
+            diversity_discr_optim = unwrap_optim(self.diversity_discr_optim).state_dict() if self.use_diversity_discr else None,
         )
 
         torch.save(pkg, str(path))
 
     def load(self, path):
         unwrap = self.unwrap_model
+        unwrap_optim = lambda opt: opt.optimizer if hasattr(opt, 'optimizer') else opt
         path = Path(path)
 
         assert path.exists()
@@ -1240,20 +1319,28 @@ class Agent(Module):
         pkg = torch.load(str(path), weights_only = True)
 
         unwrap(self.actor).load_state_dict(pkg['actor'])
-
         unwrap(self.critic).load_state_dict(pkg['critic'])
 
         if self.use_critic_ema:
             self.critic_ema.load_state_dict(pkg['critic_ema'])
 
-        if exists(pkg.get('latents', None)):
+        if 'latents' in pkg and exists(pkg['latents']):
             self.latent_gene_pool.load_state_dict(pkg['latents'])
 
-        unwrap(self.actor_optim).load_state_dict(pkg['actor_optim'])
-        unwrap(self.critic_optim).load_state_dict(pkg['critic_optim'])
+        if self.use_diversity_discr and 'diversity_discr' in pkg and exists(pkg['diversity_discr']):
+            unwrap(self.diversity_discr).load_state_dict(pkg['diversity_discr'])
 
-        if exists(pkg.get('latent_optim', None)):
-            unwrap(self.latent_optim).load_state_dict(pkg['latent_optim'])
+        if 'has_diversity_discr_warmed_up' in pkg:
+            self.has_diversity_discr_warmed_up.copy_(tensor(pkg['has_diversity_discr_warmed_up']))
+
+        unwrap_optim(self.actor_optim).load_state_dict(pkg['actor_optim'])
+        unwrap_optim(self.critic_optim).load_state_dict(pkg['critic_optim'])
+
+        if 'latent_optim' in pkg and exists(pkg['latent_optim']):
+            unwrap_optim(self.latent_optim).load_state_dict(pkg['latent_optim'])
+
+        if self.use_diversity_discr and 'diversity_discr_optim' in pkg and exists(pkg['diversity_discr_optim']):
+            unwrap_optim(self.diversity_discr_optim).load_state_dict(pkg['diversity_discr_optim'])
 
     @move_input_tensors_to_device
     def get_actor_actions(
@@ -1430,11 +1517,28 @@ class Agent(Module):
                 self.critic_optim.step()
                 self.critic_optim.zero_grad()
 
+                # learn diversity discriminator
+
+                diversity_discr_loss = self.zero
+
+                if self.use_diversity_discr:
+                    diversity_discr_logits = self.diversity_discr(states, actions)
+                    diversity_discr_loss = F.cross_entropy(diversity_discr_logits, latent_gene_ids)
+
+                    diversity_discr_loss.backward()
+
+                    if exists(self.has_grad_clip):
+                        self.clip_grad_norm_(self.diversity_discr.parameters(), self.max_grad_norm)
+
+                    self.diversity_discr_optim.step()
+                    self.diversity_discr_optim.zero_grad()
+
                 # log actor critic loss
 
                 self.log(
                     actor_loss = actor_loss.item(),
                     critic_loss = critic_loss.item(),
+                    diversity_discr_loss = diversity_discr_loss.item(),
                     fitness_scores = fitness_scores
                 )
 
@@ -1475,10 +1579,27 @@ class Agent(Module):
             for _, states, *_ in tqdm(dataloader, desc = 'state norm learning'):
                 self.state_norm(states)
 
+        # update warmed up state for discriminator
+
+        if self.use_diversity_discr:
+            self.has_diversity_discr_warmed_up.copy_(tensor(True))
+
         # apply evolution
 
         if self.has_latent_genes:
-            self.latent_gene_pool.genetic_algorithm_step(fitness_scores)
+            should_update, _ = self.latent_gene_pool.genetic_algorithm_step(fitness_scores)
+
+            if self.use_diversity_discr and should_update:
+                self.has_diversity_discr_warmed_up.copy_(tensor(False))
+
+                # reset discriminator
+
+                unwrap = self.unwrap_model
+                unwrap(self.diversity_discr).reset_parameters()
+
+                # reset optimizer
+
+                self.diversity_discr_optim.state.clear()
 
         # maybe shrink and perturb
 
@@ -1623,11 +1744,13 @@ class EPO(Module):
         episodes_per_latent,
         max_episode_length,
         action_sample_temperature = 1.,
-        fix_environ_across_latents = True
+        fix_environ_across_latents = True,
+        diversity_reward_weight = 1.,
     ):
         super().__init__()
         self.agent = agent
         self.action_sample_temperature = action_sample_temperature
+        self.diversity_reward_weight = diversity_reward_weight
 
         self.num_latents = agent.latent_gene_pool.num_latents if agent.has_latent_genes else 1
         self.episodes_per_latent = episodes_per_latent
@@ -1635,6 +1758,7 @@ class EPO(Module):
         self.fix_environ_across_latents = fix_environ_across_latents
 
         self.register_buffer('dummy', tensor(0, device = agent.device))
+        self.register_buffer('zero', tensor(0., device = agent.device))
 
     @property
     def device(self):
@@ -1740,6 +1864,20 @@ class EPO(Module):
                 # get the next state, action, and reward
 
                 state, reward, truncated, terminated, _ = interface_torch_numpy(env.step, device = self.device)(action)
+
+                # diversity reward
+
+                if self.agent.use_diversity_discr and self.agent.has_diversity_discr_warmed_up.item():
+                    with torch.no_grad():
+                        diversity_discr = self.agent.unwrap_model(self.agent.diversity_discr)
+                        diversity_discr.eval()
+
+                        logits = diversity_discr(rearrange(state, '... -> 1 ...'), rearrange(action, '... -> 1 ...'))
+                        log_probs = logits.log_softmax(dim=-1)
+
+                        diversity_reward = log_probs[0, latent_id] + log(tensor(self.agent.num_latents))
+
+                        reward = reward + diversity_reward * self.diversity_reward_weight
 
                 done = truncated or terminated
 

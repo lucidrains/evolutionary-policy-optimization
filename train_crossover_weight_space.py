@@ -140,7 +140,7 @@ for i in range(1000):
             fitnesses = 1. / eval_loss
 
             pop_net.genetic_algorithm_step_(fitnesses)
-            
+
             # new optim
 
             optim = Adam(pop_net.parameters(), lr = learning_rate)

@@ -1,6 +1,6 @@
 [project]
 name = "evolutionary-policy-optimization"
-version = "0.2.16"
+version = "0.2.18"
 description = "EPO - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -32,7 +32,8 @@ dependencies = [
     'ema-pytorch>=0.7.7',
     'hl-gauss-pytorch>=0.1.19',
     'torch>=2.2',
-    'tqdm'
+    'tqdm',
+    "x-mlps-pytorch>=0.3.0",
 ]
 
 [project.urls]

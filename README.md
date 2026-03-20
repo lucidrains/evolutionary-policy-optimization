@@ -245,13 +245,13 @@ That's it
 
 ```bibtex
 @misc{xie2025simplepolicyoptimization,
-    title   = {Simple Policy Optimization}, 
+    title   = {Simple Policy Optimization},
     author  = {Zhengpeng Xie and Qiang Zhang and Fan Yang and Marco Hutter and Renjing Xu},
     year    = {2025},
     eprint  = {2401.16025},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url = {https://arxiv.org/abs/2401.16025}, 
+    url = {https://arxiv.org/abs/2401.16025},
 }
 ```
 
@@ -280,13 +280,24 @@ That's it
 
 ```bibtex
 @misc{kedia2026simtoolrealobjectcentricpolicyzeroshot,
-    title   = {SimToolReal: An Object-Centric Policy for Zero-Shot Dexterous Tool Manipulation}, 
+    title   = {SimToolReal: An Object-Centric Policy for Zero-Shot Dexterous Tool Manipulation},
     author  = {Kushal Kedia and Tyler Ga Wei Lum and Jeannette Bohg and C. Karen Liu},
     year    = {2026},
     eprint  = {2602.16863},
     archivePrefix = {arXiv},
     primaryClass = {cs.RO},
-    url     = {https://arxiv.org/abs/2602.16863}, 
+    url     = {https://arxiv.org/abs/2602.16863},
+}
+```
+
+```bibtex
+@article{Eysenbach2018DiversityIA,
+    title   = {Diversity is All You Need: Learning Skills without a Reward Function},
+    author  = {Benjamin Eysenbach and Abhishek Gupta and Julian Ibarz and Sergey Levine},
+    journal = {ArXiv},
+    year    = {2018},
+    volume  = {abs/1802.06070},
+    url     = {https://arxiv.org/abs/1802.06070}
 }
 ```
 
