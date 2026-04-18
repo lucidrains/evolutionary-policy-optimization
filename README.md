@@ -266,33 +266,6 @@ That's it
 ```
 
 ```bibtex
-@article{Zhu2025Hybrid,
-    author         = {Zhu, Zimo and Yu, Chuanqiang and Wang, Junti},
-    title          = {A Hybrid Genetic Algorithm and Proximal Policy Optimization System for Efficient Multi-Agent Task Allocation},
-    journal        = {Systems},
-    volume         = {13},
-    year           = {2025},
-    number         = {6},
-    article-number = {453},
-    url            = {https://www.mdpi.com/2079-8954/13/6/453},
-    issn           = {2079-8954}
-```
-
-```bibtex
-@misc{kedia2026simtoolrealobjectcentricpolicyzeroshot,
-    title   = {SimToolReal: An Object-Centric Policy for Zero-Shot Dexterous Tool Manipulation},
-@misc{kedia2026simtoolrealobjectcentricpolicyzeroshot,
-    title   = {SimToolReal: An Object-Centric Policy for Zero-Shot Dexterous Tool Manipulation}, 
-    author  = {Kushal Kedia and Tyler Ga Wei Lum and Jeannette Bohg and C. Karen Liu},
-    year    = {2026},
-    eprint  = {2602.16863},
-    archivePrefix = {arXiv},
-    primaryClass = {cs.RO},
-    url     = {https://arxiv.org/abs/2602.16863},
-}
-```
-
-```bibtex
 @article{Eysenbach2018DiversityIA,
     title   = {Diversity is All You Need: Learning Skills without a Reward Function},
     author  = {Benjamin Eysenbach and Abhishek Gupta and Julian Ibarz and Sergey Levine},

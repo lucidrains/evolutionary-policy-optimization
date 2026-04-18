@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch.func import vmap, functional_call
 from torch.nn import Module, ParameterList
 
+import einx
 from einops import rearrange, reduce, repeat
 
 def exists(v):
@@ -31,11 +32,12 @@ def shrink_and_perturb_(
 
 def crossover_weights(
     w1, w2,
+    alpha = 0.5,
     shrink_perturb = False,
     shrink_factor = 0.4,
     perturb_factor = 0.1
 ):
-    assert w2.shape == w2.shape
+    assert w1.shape == w2.shape
 
     no_batch = w1.ndim == 2
 
@@ -58,12 +60,17 @@ def crossover_weights(
     u1, s1, v1 = torch.svd(w1)
     u2, s2, v2 = torch.svd(w2)
 
-    batch_randperm = torch.randn((batch, rank), device = w1.device).argsort(dim = -1)
-    mask = batch_randperm < (rank // 2)
+    sign = einx.dot('b j d, b j d -> b d', v1, v2).sign()
 
-    u = torch.where(mask[:, None, :], u1, u2)
-    s = torch.where(mask, s1, s2)
-    v = torch.where(mask[:, :, None], v1, v2)
+    u2 = einx.multiply('b i d, b d -> b i d', u2, sign)
+    v2 = einx.multiply('b j d, b d -> b j d', v2, sign)
+
+    batch_randperm = torch.randn((batch, rank), device = w1.device).argsort(dim = -1)
+    mask = batch_randperm < int(rank * alpha)
+
+    u = einx.where('b d, b i d, b i d -> b i d', mask, u1, u2)
+    s = einx.where('b d, b d, b d -> b d', mask, s1, s2)
+    v = einx.where('b d, b j d, b j d -> b j d', mask, v1, v2)
 
     out = u @ torch.diag_embed(s) @ v.mT
 
