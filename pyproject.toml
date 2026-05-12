@@ -1,6 +1,6 @@
 [project]
 name = "evolutionary-policy-optimization"
-version = "0.2.19"
+version = "0.2.20"
 description = "EPO - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -14,7 +14,7 @@ keywords = [
     'reinforcement learning',
     'genetic algorithms',
     'robotics'
-  ]
+]
 classifiers = [
     'Development Status :: 4 - Beta',
     'Intended Audience :: Developers',
@@ -42,9 +42,13 @@ Repository = "https://github.com/lucidrains/evolutionary-policy-optimization"
 
 [project.optional-dependencies]
 examples = [
+    "fire",
+    "gymnasium[box2d]>=1.0.0",
+    "moviepy",
     "numpy",
-    "pufferlib>=2.0.6",
+    "swig",
     "tqdm",
+    "wandb",
 ]
 
 experimental = [

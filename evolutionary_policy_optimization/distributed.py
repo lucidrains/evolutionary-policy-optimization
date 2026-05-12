@@ -86,3 +86,7 @@ def all_gather_variable_dim(t, dim = 0, sizes = None):
     gathered_tensors = gathered_tensors.index_select(dim, indices)
 
     return gathered_tensors, sizes
+
+def all_gather(t, dim = 0):
+    gathered, _ = all_gather_variable_dim(t, dim = dim)
+    return gathered

@@ -28,7 +28,7 @@ from evolutionary_policy_optimization.distributed import (
     is_distributed,
     get_world_and_rank,
     maybe_sync_seed,
-    all_gather_variable_dim,
+    all_gather,
     maybe_barrier
 )
 
@@ -1121,6 +1121,7 @@ class Agent(Module):
         get_fitness_scores: Callable[..., Tensor] = get_fitness_scores,
         wrap_with_accelerate: bool = True,
         accelerate_kwargs: dict = dict(),
+        accelerator = None,
     ):
         super().__init__()
 
@@ -1129,8 +1130,7 @@ class Agent(Module):
         self.wrap_with_accelerate = wrap_with_accelerate
 
         if wrap_with_accelerate:
-            accelerate = Accelerator(**accelerate_kwargs)
-            self.accelerate = accelerate
+            self.accelerate = accelerator if exists(accelerator) else Accelerator(**accelerate_kwargs)
 
         # state norm
 
@@ -1239,35 +1239,40 @@ class Agent(Module):
 
         if wrap_with_accelerate:
             self.clip_grad_norm_ = self.accelerate.clip_grad_norm_
+            device = self.accelerate.device
+
+            # device placement for modules without gradient parameters
+
+            for m in (self.state_norm, self.latent_gene_pool):
+                if exists(m):
+                    m.to(device)
+
+            # DDP wrap models with gradient parameters + prepare optimizers
 
             (
-                self.state_norm,
                 self.actor,
                 self.critic,
-                self.latent_gene_pool,
-                self.diversity_discr,
                 self.actor_optim,
                 self.critic_optim,
-                self.latent_optim,
-                self.diversity_discr_optim,
-            ) = tuple(
-                maybe(self.accelerate.prepare)(m) for m in (
-                    self.state_norm,
-                    self.actor,
-                    self.critic,
-                    self.latent_gene_pool,
-                    self.diversity_discr,
-                    self.actor_optim,
-                    self.critic_optim,
-                    self.latent_optim,
-                    self.diversity_discr_optim,
-                )
+            ) = self.accelerate.prepare(
+                self.actor,
+                self.critic,
+                self.actor_optim,
+                self.critic_optim,
             )
 
-            if exists(self.critic_ema):
-                self.critic_ema.to(self.accelerate.device)
+            if exists(self.diversity_discr):
+                self.diversity_discr, self.diversity_discr_optim = self.accelerate.prepare(
+                    self.diversity_discr, self.diversity_discr_optim
+                )
 
-            step = step.to(self.accelerate.device)
+            if exists(self.latent_optim):
+                self.latent_optim = self.accelerate.prepare(self.latent_optim)
+
+            if exists(self.critic_ema):
+                self.critic_ema.to(device)
+
+            step = step.to(device)
 
         # device tracking
 
@@ -1418,9 +1423,8 @@ class Agent(Module):
         maybe_barrier()
 
         if is_distributed():
-            memories = map(partial(all_gather_variable_dim, dim = 0), memories)
-
-            rewards_per_latent_episode = dist.all_reduce(rewards_per_latent_episode)
+            memories = [all_gather(m) for m in memories]
+            dist.all_reduce(rewards_per_latent_episode)
 
         # calculate fitness scores
 
@@ -1500,7 +1504,7 @@ class Agent(Module):
 
                 # learn critic with maybe classification loss
 
-                critic_loss = self.critic.forward_for_loss(
+                critic_loss = self.unwrap_model(self.critic).forward_for_loss(
                     states,
                     latents,
                     old_values = old_values,
@@ -1668,6 +1672,7 @@ def create_agent(
     critic_dim,
     critic_mlp_depth,
     use_critic_ema = True,
+    use_state_norm = False,
     latent_gene_pool_kwargs: dict = dict(),
     actor_kwargs: dict = dict(),
     critic_kwargs: dict = dict(),
@@ -1685,7 +1690,7 @@ def create_agent(
         **latent_gene_pool_kwargs
     ) if has_latent_genes else None
 
-    state_norm = StateNorm(dim = dim_state)
+    state_norm = StateNorm(dim = dim_state) if use_state_norm else None
 
     actor = Actor(
         num_actions = actor_num_actions,

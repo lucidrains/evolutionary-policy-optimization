@@ -91,6 +91,34 @@ agent.save('./agent.pt', overwrite = True)
 agent.load('./agent.pt')
 ```
 
+## Train Gym
+
+An example training script for LunarLander-v3 is provided at `train_gym.py`
+
+First install example dependencies
+
+```bash
+$ pip install '.[examples]' # or `uv pip install '.[examples]'`
+```
+
+Single process
+
+```bash
+$ python train_gym.py --cpu
+```
+
+Distributed with 8 processes (one latent per process)
+
+```bash
+$ torchrun --nproc_per_node=8 train_gym.py --cpu
+```
+
+With wandb logging
+
+```bash
+$ torchrun --nproc_per_node=8 train_gym.py --cpu --use_wandb
+```
+
 ## Contributing
 
 At the project root, run
@@ -273,31 +301,32 @@ That's it
     year    = {2018},
     volume  = {abs/1802.06070},
     url     = {https://arxiv.org/abs/1802.06070}
-    url     = {https://arxiv.org/abs/2602.16863}, 
+}
 ```
 
 ```bibtex
 @article{Zhu2025Hybrid,
-    author         = {Zhu, Zimo and Yu, Chuanqiang and Wang, Junti},
-    title          = {A Hybrid Genetic Algorithm and Proximal Policy Optimization System for Efficient Multi-Agent Task Allocation},
-    journal        = {Systems},
-    volume         = {13},
-    year           = {2025},
-    number         = {6},
+    author  = {Zhu, Zimo and Yu, Chuanqiang and Wang, Junti},
+    title   = {A Hybrid Genetic Algorithm and Proximal Policy Optimization System for Efficient Multi-Agent Task Allocation},
+    journal = {Systems},
+    volume  = {13},
+    year    = {2025},
+    number  = {6},
     article-number = {453},
-    url            = {https://www.mdpi.com/2079-8954/13/6/453},
-    issn           = {2079-8954}
+    url     = {https://www.mdpi.com/2079-8954/13/6/453},
+    issn    = {2079-8954}
+}
 ```
 
 ```bibtex
 @misc{kedia2026simtoolrealobjectcentricpolicyzeroshot,
-    title   = {SimToolReal: An Object-Centric Policy for Zero-Shot Dexterous Tool Manipulation}, 
+    title   = {SimToolReal: An Object-Centric Policy for Zero-Shot Dexterous Tool Manipulation},
     author  = {Kushal Kedia and Tyler Ga Wei Lum and Jeannette Bohg and C. Karen Liu},
     year    = {2026},
     eprint  = {2602.16863},
     archivePrefix = {arXiv},
     primaryClass = {cs.RO},
-    url     = {https://arxiv.org/abs/2602.16863}, 
+    url     = {https://arxiv.org/abs/2602.16863},
 }
 ```
 
