@@ -540,13 +540,11 @@ class DiversityDiscr(Module):
     def __init__(
         self,
         dim_state,
-        num_actions,
         num_latents,
         dim = 64,
         depth = 2
     ):
         super().__init__()
-        self.action_embed = nn.Embedding(num_actions, dim)
         self.state_proj = nn.Linear(dim_state, dim)
 
         self.net = AttnResidualNormedMLP(
@@ -558,13 +556,13 @@ class DiversityDiscr(Module):
 
     def reset_parameters(self):
         for module in self.modules():
-            if isinstance(module, (nn.Linear, nn.LayerNorm, nn.RMSNorm, nn.Embedding)):
+            if isinstance(module, (nn.Linear, nn.LayerNorm, nn.RMSNorm)):
                 module.reset_parameters()
 
-    def forward(self, state, action):
+    def forward(self, state, next_state):
         state_embed = self.state_proj(state)
-        action_embed = self.action_embed(action)
-        return self.net((state_embed, action_embed))
+        next_state_embed = self.state_proj(next_state)
+        return self.net((state_embed, next_state_embed))
 
 # actor, critic, and agent (actor + critic)
 # eventually, should just create a separate repo and aggregate all the MLP related architectures
@@ -1201,11 +1199,9 @@ class Agent(Module):
         if use_diversity_discr:
             assert exists(latent_gene_pool), 'latent_gene_pool must be present to use DIAYN'
             dim_state = actor.init_layer[0].in_features
-            num_actions = actor.to_out[1].out_features
 
             self.diversity_discr = DiversityDiscr(
                 dim_state = dim_state,
-                num_actions = num_actions,
                 num_latents = latent_gene_pool.num_latents,
                 **diversity_discr_kwargs
             )
@@ -1281,6 +1277,10 @@ class Agent(Module):
     @property
     def device(self):
         return self.step.device
+
+    @property
+    def is_main_process(self):
+        return not self.wrap_with_accelerate or self.accelerate.is_main_process
 
     @property
     def unwrapped_latent_gene_pool(self):
@@ -1435,6 +1435,7 @@ class Agent(Module):
         (
             episode_ids,
             states,
+            next_states,
             latent_gene_ids,
             actions,
             log_probs,
@@ -1457,7 +1458,7 @@ class Agent(Module):
 
         valid_episode = episode_ids >= 0
 
-        dataset = TensorDataset(*[t[valid_episode] for t in (advantages, states, latent_gene_ids, actions, log_probs, values)])
+        dataset = TensorDataset(*[t[valid_episode] for t in (advantages, states, next_states, latent_gene_ids, actions, log_probs, values)])
 
         dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
 
@@ -1469,10 +1470,11 @@ class Agent(Module):
         self.actor.train()
         self.critic.train()
 
-        for _ in tqdm(range(epochs), desc = 'learning actor/critic epoch'):
+        for _ in tqdm(range(epochs), desc = 'learning actor/critic epoch', disable = not self.is_main_process):
             for (
                 advantages,
                 states,
+                next_states,
                 latent_gene_ids,
                 actions,
                 log_probs,
@@ -1526,7 +1528,7 @@ class Agent(Module):
                 diversity_discr_loss = self.zero
 
                 if self.use_diversity_discr:
-                    diversity_discr_logits = self.diversity_discr(states, actions)
+                    diversity_discr_logits = self.diversity_discr(states, next_states)
                     diversity_discr_loss = F.cross_entropy(diversity_discr_logits, latent_gene_ids)
 
                     diversity_discr_loss.backward()
@@ -1580,7 +1582,7 @@ class Agent(Module):
         if exists(self.state_norm):
             self.state_norm.train()
 
-            for _, states, *_ in tqdm(dataloader, desc = 'state norm learning'):
+            for _, states, *_ in tqdm(dataloader, desc = 'state norm learning', disable = not self.is_main_process):
                 self.state_norm(states)
 
         # update warmed up state for discriminator
@@ -1728,6 +1730,7 @@ def create_agent(
 Memory = namedtuple('Memory', [
     'episode_id',
     'state',
+    'next_state',
     'latent_gene_id',
     'action',
     'log_prob',
@@ -1835,7 +1838,7 @@ class EPO(Module):
 
         rollout_gen = self.rollouts_for_machine(fix_environ_across_latents)
 
-        for latent_id, episode_id, maybe_seed in tqdm(rollout_gen, desc = 'rollout'):
+        for latent_id, episode_id, maybe_seed in tqdm(rollout_gen, desc = 'rollout', disable = not self.agent.is_main_process):
 
             time = 0
 
@@ -1868,7 +1871,7 @@ class EPO(Module):
 
                 # get the next state, action, and reward
 
-                state, reward, truncated, terminated, _ = interface_torch_numpy(env.step, device = self.device)(action)
+                next_state, reward, truncated, terminated, _ = interface_torch_numpy(env.step, device = self.device)(action)
 
                 # diversity reward
 
@@ -1877,7 +1880,7 @@ class EPO(Module):
                         diversity_discr = self.agent.unwrap_model(self.agent.diversity_discr)
                         diversity_discr.eval()
 
-                        logits = diversity_discr(rearrange(state, '... -> 1 ...'), rearrange(action, '... -> 1 ...'))
+                        logits = diversity_discr(rearrange(state, '... -> 1 ...'), rearrange(next_state, '... -> 1 ...'))
                         log_probs = logits.log_softmax(dim=-1)
 
                         diversity_reward = log_probs[0, latent_id] + log(tensor(self.agent.num_latents))
@@ -1895,6 +1898,7 @@ class EPO(Module):
                 memory = Memory(
                     tensor(episode_id),
                     state,
+                    next_state,
                     tensor(latent_id),
                     action,
                     log_prob,
@@ -1907,12 +1911,14 @@ class EPO(Module):
 
                 memories.append(memory)
 
+                state = next_state
+
                 time += 1
 
             if not terminated:
                 # add bootstrap value if truncated
 
-                next_value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent, use_ema_if_available = True, use_unwrapped_model = True)
+                next_value = temp_batch_dim(self.agent.get_critic_values)(next_state, latent = latent, use_ema_if_available = True, use_unwrapped_model = True)
 
                 memory_for_gae = memory._replace(
                     episode_id = invalid_episode,
@@ -1939,7 +1945,7 @@ class EPO(Module):
             torch.manual_seed(seed)
             np.random.seed(seed)
 
-        for _ in tqdm(range(num_learning_cycles), desc = 'learning cycle'):
+        for _ in tqdm(range(num_learning_cycles), desc = 'learning cycle', disable = not self.agent.is_main_process):
 
             memories = self.gather_experience_from(env)
 
