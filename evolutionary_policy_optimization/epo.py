@@ -362,7 +362,7 @@ class StateNorm(Module):
         self,
         state
     ):
-        assert state.shape[-1] == self.dim, f'expected feature dimension of {self.dim} but received {x.shape[-1]}'
+        assert state.shape[-1] == self.dim, f'expected feature dimension of {self.dim} but received {state.shape[-1]}'
 
         time = self.step.item()
         mean = self.running_mean
@@ -512,7 +512,7 @@ class MLP(Module):
             if latent.ndim == 1:
                 latent = repeat(latent, 'd -> b d', b = batch)
 
-            assert latent.shape[0] == x.shape[0], f'received state with batch size {x.shape[0]} but latent ids received had batch size {latent_id.shape[0]}'
+            assert latent.shape[0] == x.shape[0], f'received state with batch size {x.shape[0]} but latent ids received had batch size {latent.shape[0]}'
 
         # layers
 
@@ -1922,6 +1922,7 @@ class EPO(Module):
 
                 memory_for_gae = memory._replace(
                     episode_id = invalid_episode,
+                    reward = next_value.cpu(),
                     value = next_value.cpu(),
                     done = tensor(True)
                 )
