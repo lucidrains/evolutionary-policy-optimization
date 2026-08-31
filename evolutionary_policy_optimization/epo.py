@@ -1,12 +1,12 @@
 from __future__ import annotations
 from typing import Callable
 
+import math
 from pathlib import Path
 from math import ceil
 from itertools import product
 from functools import partial, wraps
 from collections import namedtuple
-from random import randrange
 
 import numpy as np
 
@@ -19,8 +19,10 @@ from torch.utils.data import TensorDataset, DataLoader
 from torch.utils._pytree import tree_map
 
 import einx
-from einops import rearrange, repeat, reduce, einsum, pack
+from einops import rearrange, repeat, reduce, einsum
 from einops.layers.torch import Rearrange
+
+from torch.distributions import Beta as _Beta, Categorical, Distribution
 
 from x_mlps_pytorch import AttnResidualNormedMLP
 
@@ -80,10 +82,15 @@ def interface_torch_numpy(fn, device):
 
     @maybe
     def to_torch_tensor(t):
-        if isinstance(t, (np.ndarray, np.float64)):
+        if isinstance(t, np.ndarray):
             t = from_numpy(np.array(t))
+        elif isinstance(t, np.generic):
+            t = tensor(t.item())
         elif isinstance(t, (float, int, bool)):
             t = tensor(t)
+
+        if is_tensor(t) and t.is_floating_point():
+            t = t.float()
 
         return t.to(device)
 
@@ -120,29 +127,18 @@ def batch_randperm(shape, device):
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
 
-def gumbel_noise(t):
-    return -log(-log(torch.rand_like(t)))
+def sum_to_batch(t):
+    # fold trailing action dims into one value per state
 
-def gumbel_sample(t, temperature = 1.):
-    is_greedy = temperature <= 0.
+    return reduce(t, 'b ... -> b', 'sum')
 
-    if not is_greedy:
-        t = (t / temperature) + gumbel_noise(t)
+def mode_action(distr):
+    # greedy action - argmax for categorical, mean for beta
 
-    return t.argmax(dim = -1)
+    if isinstance(distr, Categorical):
+        return distr.probs.argmax(dim = -1)
 
-def calc_entropy(logits):
-    prob = logits.softmax(dim = -1)
-    return -(prob * log(prob)).sum(dim = -1)
-
-def gather_log_prob(
-    logits, # Float[b l]
-    indices # Int[b]
-): # Float[b]
-    indices = rearrange(indices, '... -> ... 1')
-    log_probs = logits.log_softmax(dim = -1)
-    log_prob = log_probs.gather(-1, indices)
-    return rearrange(log_prob, '... 1 -> ...')
+    return distr.mean
 
 def temp_batch_dim(fn):
 
@@ -564,6 +560,62 @@ class DiversityDiscr(Module):
         next_state_embed = self.state_proj(next_state)
         return self.net((state_embed, next_state_embed))
 
+# action distributions - the actor always returns a `Distribution`, either
+# categorical (discrete) or beta mean-conc (continuous, bounded to (0, 1) by
+# construction - scale to the env's action range at the interface)
+
+class CategoricalActionDistr(Module):
+    def forward(self, logits, temperature = 1.):
+        if temperature > 0. and temperature != 1.:
+            logits = logits / temperature
+
+        return Categorical(logits = logits)
+
+class BetaActionDistr(Module):
+    def __init__(
+        self,
+        init_conc = 2.,
+        min_conc = 0.,
+        eps = 1e-5
+    ):
+        super().__init__()
+        assert init_conc > min_conc
+
+        self.init_conc = init_conc
+        self.min_conc = min_conc
+        self.eps = eps
+
+        # softplus offset so the concentration at raw_conc = 0 is exactly init_conc
+
+        self.raw_init_conc = math.log(math.expm1(init_conc - min_conc))
+
+    def mean(self, params):
+        # the beta mean is exactly (tanh(raw_mean) + 1) / 2 by construction
+
+        raw_mean, _ = params.unbind(dim = -1)
+        return ((torch.tanh(raw_mean) + 1.) * 0.5).clamp(min = self.eps, max = 1. - self.eps)
+
+    def forward(self, params, temperature = 1.):
+        _, raw_conc = params.unbind(dim = -1)
+
+        mean = self.mean(params)
+
+        conc = F.softplus(raw_conc + self.raw_init_conc) + self.min_conc
+
+        # concentration floor - unimodal (alpha > 1 and beta > 1), mean kept exact
+
+        conc = conc + 1. / torch.minimum(mean, 1. - mean).clamp(min = self.eps)
+
+        # temperature scales the concentration - lower temperature, sharper policy
+
+        if temperature > 0. and temperature != 1.:
+            conc = conc / temperature
+
+        alpha = mean * conc
+        beta = (1. - mean) * conc
+
+        return _Beta(alpha, beta)
+
 # actor, critic, and agent (actor + critic)
 # eventually, should just create a separate repo and aggregate all the MLP related architectures
 
@@ -576,12 +628,14 @@ class Actor(Module):
         mlp_depth,
         state_norm: StateNorm | None = None,
         dim_latent = 0,
+        action_is_continuous = False, # continuous control - beta policy
     ):
         super().__init__()
 
         self.state_norm = state_norm
 
         self.dim_latent = dim_latent
+        self.beta_actions = action_is_continuous
 
         self.init_layer = nn.Sequential(
             nn.Linear(dim_state, dim),
@@ -590,16 +644,28 @@ class Actor(Module):
 
         self.mlp = MLP(dim = dim, depth = mlp_depth, dim_latent = dim_latent)
 
-        self.to_out = nn.Sequential(
-            nn.RMSNorm(dim),
-            nn.Linear(dim, num_actions, bias = False),
-        )
+        if self.beta_actions:
+            # beta head - (raw mean, raw concentration) per action dim
+
+            self.to_out = nn.Sequential(
+                nn.RMSNorm(dim),
+                nn.Linear(dim, num_actions * 2, bias = False),
+                Rearrange('... (d params) -> ... d params', params = 2),
+            )
+        else:
+            self.to_out = nn.Sequential(
+                nn.RMSNorm(dim),
+                nn.Linear(dim, num_actions, bias = False),
+            )
+
+        self.action_distr = BetaActionDistr() if self.beta_actions else CategoricalActionDistr()
 
     def forward(
         self,
         state,
-        latent
-    ):
+        latent,
+        temperature = 1.
+    ) -> Distribution:
         if exists(self.state_norm):
             with torch.no_grad():
                 self.state_norm.eval()
@@ -609,7 +675,7 @@ class Actor(Module):
 
         hidden = self.mlp(hidden, latent)
 
-        return self.to_out(hidden)
+        return self.action_distr(self.to_out(hidden), temperature = temperature)
 
 class Critic(Module):
     def __init__(
@@ -621,8 +687,8 @@ class Critic(Module):
         use_regression = False,
         state_norm: StateNorm | None = None,
         hl_gauss_loss_kwargs: dict = dict(
-            min_value = -10.,
-            max_value = 10.,
+            min_value = 0.,
+            max_value = 500.,
             num_bins = 250
         )
     ):
@@ -715,27 +781,37 @@ class Critic(Module):
 
         hidden = self.final_norm(hidden)
 
-        pred_kwargs = dict(return_logits = return_logits) if not self.use_regression else dict()
-        return self.to_pred(hidden, **pred_kwargs)
+        if self.use_regression:
+            return self.to_pred(hidden)
+
+        logits = self.to_pred(hidden, return_logits = True)
+
+        if return_logits:
+            return logits
+
+        value = self.maybe_bins_to_value(logits)
+
+        return value
 
 # criteria for running genetic algorithm
 
 class ShouldRunGeneticAlgorithm(Module):
     def __init__(
         self,
-        gamma = 1.5 # not sure what the value is
+        gamma = 0.25,     # fire when the spread exceeds this fraction of the fitness level
+        min_spread = 1.0, # absolute spread floor
     ):
         super().__init__()
         self.gamma = gamma
+        self.min_spread = min_spread
 
     def forward(self, fitnesses):
-        # equation (3)
+        # eq (3) - fire when the fitness spread is a meaningful fraction of the level
 
-        # max(fitness) - min(fitness) > gamma * median(fitness)
-        # however, this equation does not make much sense to me if fitness increases unbounded
-        # just let it be customizable, and offer a variant where mean and variance is over some threshold (could account for skew too)
+        spread = fitnesses.amax(dim = -1) - fitnesses.amin(dim = -1)
+        scale = torch.abs(fitnesses.median(dim = -1).values)
 
-        return (fitnesses.amax(dim = -1) - fitnesses.amin(dim = -1)) > (self.gamma * torch.median(fitnesses, dim = -1).values)
+        return spread > (self.gamma * scale + self.min_spread)
 
 # classes
 
@@ -756,7 +832,7 @@ class LatentGenePool(Module):
         fast_genetic_algorithm = False,
         fast_ga_values = torch.linspace(1, 5, 10),
         should_run_genetic_algorithm: Module | None = None, # eq (3) in paper
-        default_should_run_ga_gamma = 1.5,
+        default_should_run_ga_gamma = 0.25,
         migrate_every = 100,                 # how many steps before a migration between islands
         apply_genetic_algorithm_every = 2,   # how many steps before crossover + mutation happens for genes
         init_latent_fn: Callable | None = None
@@ -1120,8 +1196,11 @@ class Agent(Module):
         wrap_with_accelerate: bool = True,
         accelerate_kwargs: dict = dict(),
         accelerator = None,
+        quiet: bool = False,
     ):
         super().__init__()
+
+        self.quiet = quiet
 
         # hf accelerate
 
@@ -1348,6 +1427,22 @@ class Agent(Module):
             unwrap_optim(self.diversity_discr_optim).load_state_dict(pkg['diversity_discr_optim'])
 
     @move_input_tensors_to_device
+    def get_actor_distribution(
+        self,
+        state,
+        latent_id = None,
+        latent = None,
+        temperature = 1.,
+        use_unwrapped_model = False
+    ) -> Distribution:
+        maybe_unwrap = identity if not use_unwrapped_model else self.unwrap_model
+
+        if not exists(latent) and exists(latent_id) and exists(self.latent_gene_pool):
+            latent = maybe_unwrap(self.latent_gene_pool)(latent_id = latent_id)
+
+        return maybe_unwrap(self.actor)(state, latent, temperature = temperature)
+
+    @move_input_tensors_to_device
     def get_actor_actions(
         self,
         state,
@@ -1357,19 +1452,22 @@ class Agent(Module):
         temperature = 1.,
         use_unwrapped_model = False
     ):
-        maybe_unwrap = identity if not use_unwrapped_model else self.unwrap_model
-
-        if not exists(latent) and exists(latent_id):
-            latent = maybe_unwrap(self.latent_gene_pool)(latent_id = latent_id)
-
-        logits = maybe_unwrap(self.actor)(state, latent)
+        distr = self.get_actor_distribution(
+            state,
+            latent_id = latent_id,
+            latent = latent,
+            temperature = temperature if sample else 1.,
+            use_unwrapped_model = use_unwrapped_model
+        )
 
         if not sample:
-            return logits
+            return mode_action(distr)
 
-        actions = gumbel_sample(logits, temperature = temperature)
+        # temperature <= 0 is greedy - mode works for both discrete and continuous
 
-        log_probs = gather_log_prob(logits, actions)
+        actions = mode_action(distr) if temperature <= 0. else distr.sample()
+
+        log_probs = sum_to_batch(distr.log_prob(actions))
 
         return actions, log_probs
 
@@ -1385,7 +1483,7 @@ class Agent(Module):
 
         maybe_unwrap = identity if not use_unwrapped_model else self.unwrap_model
 
-        if not exists(latent) and exists(latent_id):
+        if not exists(latent) and exists(latent_id) and exists(self.latent_gene_pool):
             latent = maybe_unwrap(self.latent_gene_pool)(latent_id = latent_id)
 
         critic_forward = maybe_unwrap(self.critic)
@@ -1470,7 +1568,7 @@ class Agent(Module):
         self.actor.train()
         self.critic.train()
 
-        for _ in tqdm(range(epochs), desc = 'learning actor/critic epoch', disable = not self.is_main_process):
+        for _ in tqdm(range(epochs), desc = 'learning actor/critic epoch', disable = self.quiet or not self.is_main_process):
             for (
                 advantages,
                 states,
@@ -1492,9 +1590,12 @@ class Agent(Module):
 
                 # learn actor
 
-                logits = self.actor(states, latents)
+                distr = self.actor(states, latents)
 
-                actor_loss = self.actor_loss(logits, log_probs, actions, advantages, use_spo = self.use_spo)
+                actor_loss = self.actor_loss(
+                    distr, log_probs, actions, advantages,
+                    use_spo = self.use_spo
+                )
 
                 actor_loss.backward()
 
@@ -1582,7 +1683,7 @@ class Agent(Module):
         if exists(self.state_norm):
             self.state_norm.train()
 
-            for _, states, *_ in tqdm(dataloader, desc = 'state norm learning', disable = not self.is_main_process):
+            for _, states, *_ in tqdm(dataloader, desc = 'state norm learning', disable = self.quiet or not self.is_main_process):
                 self.state_norm(states)
 
         # update warmed up state for discriminator
@@ -1591,6 +1692,8 @@ class Agent(Module):
             self.has_diversity_discr_warmed_up.copy_(tensor(True))
 
         # apply evolution
+
+        should_update = False
 
         if self.has_latent_genes:
             should_update, _ = self.latent_gene_pool.genetic_algorithm_step(fitness_scores)
@@ -1617,12 +1720,14 @@ class Agent(Module):
 
         self.step.add_(1)
 
+        return should_update, fitness_scores
+
 # reinforcement learning related - ppo
 
 def actor_loss(
-    logits,         # Float[b l]
+    distr,
     old_log_probs,  # Float[b]
-    actions,        # Int[b]
+    actions,        # Int[b], or Float[b l] for beta
     advantages,     # Float[b]
     eps_clip = 0.2,
     entropy_weight = .01,
@@ -1630,9 +1735,10 @@ def actor_loss(
     norm_advantages = True,
     use_spo = False
 ):
-    batch = logits.shape[0]
+    batch = advantages.shape[0]
 
-    log_probs = gather_log_prob(logits, actions)
+    log_probs = sum_to_batch(distr.log_prob(actions))
+    entropy = sum_to_batch(distr.entropy())
 
     ratio = (log_probs - old_log_probs).exp()
 
@@ -1655,8 +1761,6 @@ def actor_loss(
 
     # add entropy loss for exploration
 
-    entropy = calc_entropy(logits)
-
     entropy_aux_loss = -entropy_weight * entropy
 
     return (actor_loss + entropy_aux_loss).mean()
@@ -1675,6 +1779,7 @@ def create_agent(
     critic_mlp_depth,
     use_critic_ema = True,
     use_state_norm = False,
+    action_is_continuous = False, # continuous control - beta policy
     latent_gene_pool_kwargs: dict = dict(),
     actor_kwargs: dict = dict(),
     critic_kwargs: dict = dict(),
@@ -1701,6 +1806,7 @@ def create_agent(
         dim = actor_dim,
         mlp_depth = actor_mlp_depth,
         state_norm = state_norm,
+        action_is_continuous = action_is_continuous,
         **actor_kwargs
     )
 
@@ -1838,7 +1944,7 @@ class EPO(Module):
 
         rollout_gen = self.rollouts_for_machine(fix_environ_across_latents)
 
-        for latent_id, episode_id, maybe_seed in tqdm(rollout_gen, desc = 'rollout', disable = not self.agent.is_main_process):
+        for latent_id, episode_id, maybe_seed in tqdm(rollout_gen, desc = 'rollout', disable = self.agent.quiet or not self.agent.is_main_process):
 
             time = 0
 
@@ -1871,7 +1977,7 @@ class EPO(Module):
 
                 # get the next state, action, and reward
 
-                next_state, reward, truncated, terminated, _ = interface_torch_numpy(env.step, device = self.device)(action)
+                next_state, reward, terminated, truncated, _ = interface_torch_numpy(env.step, device = self.device)(action)
 
                 # diversity reward
 
@@ -1936,7 +2042,6 @@ class EPO(Module):
 
     def forward(
         self,
-        agent: Agent,
         env,
         num_learning_cycles,
         seed = None
@@ -1946,10 +2051,10 @@ class EPO(Module):
             torch.manual_seed(seed)
             np.random.seed(seed)
 
-        for _ in tqdm(range(num_learning_cycles), desc = 'learning cycle', disable = not self.agent.is_main_process):
+        for _ in tqdm(range(num_learning_cycles), desc = 'learning cycle', disable = self.agent.quiet or not self.agent.is_main_process):
 
             memories = self.gather_experience_from(env)
 
-            agent.learn_from(memories)
+            self.agent.learn_from(memories)
 
         print('training complete')

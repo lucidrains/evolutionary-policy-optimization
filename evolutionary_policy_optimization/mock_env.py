@@ -51,5 +51,5 @@ class Env(Module):
 
         self._step.add_(1)
 
-        out = (state, reward, truncated, terminated)
+        out = (state, reward, terminated, truncated)
         return (*tuple(t.numpy() for t in out), None)

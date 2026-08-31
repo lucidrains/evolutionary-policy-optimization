@@ -1,6 +1,8 @@
 import pytest
 
 import torch
+from torch.distributions import Beta, Categorical
+
 from evolutionary_policy_optimization.epo import (
     LatentGenePool,
     Actor,
@@ -34,7 +36,8 @@ def test_readme(
 
     latent = latent_pool(latent_id = latent_ids, state = state)
 
-    actions = actor(state, latent) # noqa: F841
+    action_distr = actor(state, latent)
+    assert isinstance(action_distr, Categorical)
     value = critic(state, latent) # noqa: F841
 
     # interact with environment and receive rewards, termination etc
@@ -46,6 +49,24 @@ def test_readme(
     latent_pool.genetic_algorithm_step(fitness, migrate = num_islands > 1) # update once
 
     latent_pool.firefly_step(fitness)
+
+@pytest.mark.parametrize(
+    'action_is_continuous, distribution_type',
+    ((False, Categorical), (True, Beta))
+)
+def test_actor_returns_distribution(action_is_continuous, distribution_type):
+    actor = Actor(
+        dim_state = 8,
+        dim = 16,
+        mlp_depth = 2,
+        num_actions = 3,
+        action_is_continuous = action_is_continuous
+    )
+
+    distr = actor(torch.randn(4, 8), None)
+
+    assert isinstance(distr, distribution_type)
+    assert isinstance(distr.sample(), torch.Tensor)
 
 @pytest.mark.parametrize('latent_ids', (2, (2, 4)))
 @pytest.mark.parametrize('use_spo', (False, True))
@@ -137,7 +158,7 @@ def test_e2e_with_mock_env(
 
     env = Env((512,))
 
-    epo(agent, env, num_learning_cycles = 2)
+    epo(env, num_learning_cycles = 2)
 
     # saving and loading
 

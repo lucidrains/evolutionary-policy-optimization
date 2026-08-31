@@ -37,7 +37,8 @@ critic = Critic(dim_state = 32, dim = 256, mlp_depth = 3, dim_latent = 32)
 
 latent = latent_pool(latent_id = 2)
 
-actions = actor(state, latent)
+action_distr = actor(state, latent)
+actions = action_distr.sample()
 value = critic(state, latent)
 
 # interact with environment and receive rewards, termination etc
@@ -83,7 +84,7 @@ epo = EPO(
 
 env = Env((512,))
 
-epo(agent, env, num_learning_cycles = 5)
+epo(env, num_learning_cycles = 5)
 
 # saving and loading
 
