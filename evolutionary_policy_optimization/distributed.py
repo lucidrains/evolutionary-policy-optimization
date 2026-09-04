@@ -1,12 +1,11 @@
+import einx
 import torch
-from torch import nn
+import torch.distributed as dist
 import torch.nn.functional as F
+from einops import rearrange
+from torch import nn
 from torch.autograd import Function
 
-import torch.distributed as dist
-
-import einx
-from einops import rearrange
 
 def exists(val):
     return val is not None

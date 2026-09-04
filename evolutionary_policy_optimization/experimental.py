@@ -1,14 +1,14 @@
-from random import uniform
 from copy import deepcopy
-
-import torch
-from torch import Tensor
-import torch.nn.functional as F
-from torch.func import vmap, functional_call
-from torch.nn import Module, ParameterList
+from random import uniform
 
 import einx
+import torch
+import torch.nn.functional as F
 from einops import rearrange, reduce, repeat
+from torch import Tensor
+from torch.func import functional_call, vmap
+from torch.nn import Module, ParameterList
+
 
 def exists(v):
     return v is not None

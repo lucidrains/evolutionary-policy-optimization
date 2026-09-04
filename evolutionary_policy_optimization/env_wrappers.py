@@ -5,6 +5,7 @@ from torch.nn import Module
 
 from evolutionary_policy_optimization.epo import Agent, create_agent, exists
 
+
 def rescale_from_to(x, from_range = (0., 1.), to_range = (-1., 1.)):
     # e.g. beta actions on (0, 1) -> the env's action bounds
 

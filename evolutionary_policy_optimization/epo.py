@@ -1,50 +1,36 @@
 from __future__ import annotations
-from typing import Callable
 
 import math
-from pathlib import Path
-from math import ceil
-from itertools import product
-from functools import partial, wraps
 from collections import namedtuple
-
-import numpy as np
-
-import torch
-from torch import nn, cat, stack, is_tensor, tensor, from_numpy, Tensor
-import torch.nn.functional as F
-import torch.distributed as dist
-from torch.nn import Linear, Module, ModuleList
-from torch.utils.data import TensorDataset, DataLoader
-from torch.utils._pytree import tree_map
+from copy import deepcopy
+from functools import partial, wraps
+from itertools import product
+from math import ceil
+from pathlib import Path
+from typing import Callable
 
 import einx
-from einops import rearrange, repeat, reduce, einsum
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from accelerate import Accelerator
+from adam_atan2_pytorch import AdoptAtan2
+from assoc_scan import AssocScan
+from einops import einsum, rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
+from ema_pytorch import EMA
+from hl_gauss_pytorch import HLGaussLayer
+from torch import Tensor, cat, from_numpy, is_tensor, nn, stack, tensor
+from torch.distributions import Beta, Categorical, Distribution
 
-from torch.distributions import Beta as _Beta, Categorical, Distribution
-
+from torch.nn import Linear, Module, ModuleList
+from torch.utils._pytree import tree_map
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 from x_mlps_pytorch import AttnResidualNormedMLP
 
-from evolutionary_policy_optimization.distributed import (
-    is_distributed,
-    get_world_and_rank,
-    maybe_sync_seed,
-    all_gather,
-    maybe_barrier
-)
-
-from assoc_scan import AssocScan
-
-from adam_atan2_pytorch import AdoptAtan2
-
-from hl_gauss_pytorch import HLGaussLayer
-
-from ema_pytorch import EMA
-
-from tqdm import tqdm
-
-from accelerate import Accelerator
+from evolutionary_policy_optimization.distributed import all_gather, get_world_and_rank, is_distributed, maybe_barrier, maybe_sync_seed
 
 # helpers
 
@@ -123,9 +109,6 @@ def l2norm(t, dim = -1):
 
 def batch_randperm(shape, device):
     return torch.randn(shape, device = device).argsort(dim = -1)
-
-def log(t, eps = 1e-20):
-    return t.clamp(min = eps).log()
 
 def sum_to_batch(t):
     # fold trailing action dims into one value per state
@@ -561,8 +544,8 @@ class DiversityDiscr(Module):
         return self.net((state_embed, next_state_embed))
 
 # action distributions - the actor always returns a `Distribution`, either
-# categorical (discrete) or beta mean-conc (continuous, bounded to (0, 1) by
-# construction - scale to the env's action range at the interface)
+# categorical (discrete) or beta mean-conc (continuous). beta is defined over
+# (0, 1) - rescale to the env's action range at the interface
 
 class CategoricalActionDistr(Module):
     def forward(self, logits, temperature = 1.):
@@ -595,6 +578,13 @@ class BetaActionDistr(Module):
         raw_mean, _ = params.unbind(dim = -1)
         return ((torch.tanh(raw_mean) + 1.) * 0.5).clamp(min = self.eps, max = 1. - self.eps)
 
+    def entropy(self, params, temperature = 1.):
+        # entropy is over the rescaled (2x - 1) in [-1, 1], with log 2 jacobian
+        # adjustment for the differential entropy of an affine transform
+
+        distr = self.forward(params, temperature = temperature)
+        return distr.entropy() + math.log(2.)
+
     def forward(self, params, temperature = 1.):
         _, raw_conc = params.unbind(dim = -1)
 
@@ -614,7 +604,77 @@ class BetaActionDistr(Module):
         alpha = mean * conc
         beta = (1. - mean) * conc
 
-        return _Beta(alpha, beta)
+        return Beta(alpha, beta)
+
+# self-predictive representations (SPR) over the actor's hidden embedding
+
+class HiddenSpr(Module):
+    def __init__(
+        self,
+        actor,
+        dim_hidden,
+        num_actions,
+        dim_action = 32,
+    ):
+        super().__init__()
+        action_is_continuous = actor.beta_actions
+        self.action_is_continuous = action_is_continuous
+
+        if action_is_continuous:
+            self.action_proj = nn.Linear(num_actions, dim_action)
+        else:
+            self.action_proj = nn.Embedding(num_actions, dim_action)
+
+        self.to_dynamics = nn.Sequential(
+            nn.Linear(dim_hidden + dim_action, dim_hidden),
+            nn.SiLU(),
+            nn.Linear(dim_hidden, dim_hidden)
+        )
+
+        self.proj_head = nn.Linear(dim_hidden, dim_hidden, bias = False)
+
+        # ema target of the actor body + projection head
+
+        self.target_actor = deepcopy(actor).requires_grad_(False)
+        self.target_proj = deepcopy(self.proj_head).requires_grad_(False)
+
+    def online_parameters(self):
+        return [
+            *self.action_proj.parameters(),
+            *self.to_dynamics.parameters(),
+            *self.proj_head.parameters(),
+        ]
+
+    def predict(self, hidden, action):
+        if not self.action_is_continuous:
+            action = action.long()
+            if action.ndim > 1:
+                action = rearrange(action, '... 1 -> ...')
+
+        action_proj = self.action_proj(action)
+        dynamics = self.to_dynamics(cat((hidden, action_proj), dim = -1))
+        return self.proj_head(dynamics + hidden)
+
+    @torch.no_grad()
+    def target(self, state, latent):
+        return self.target_proj(self.target_actor.latent(state, latent))
+
+    @torch.no_grad()
+    def _ema_update_one_(self, target_module, source_module, decay):
+        # if decay is 0, this is a hard copy of the source into the target
+
+        for target_param, source_param in zip(target_module.parameters(), source_module.parameters()):
+            target_param.lerp_(source_param, 1. - decay)
+
+    @torch.no_grad()
+    def ema_update(self, actor, decay):
+        self._ema_update_one_(self.target_actor.init_layer, actor.init_layer, decay)
+        self._ema_update_one_(self.target_actor.mlp, actor.mlp, decay)
+        self._ema_update_one_(self.target_proj, self.proj_head, decay)
+
+    @torch.no_grad()
+    def sync_targets_(self, actor):
+        self.ema_update(actor, decay = 0.)
 
 # actor, critic, and agent (actor + critic)
 # eventually, should just create a separate repo and aggregate all the MLP related architectures
@@ -634,6 +694,8 @@ class Actor(Module):
 
         self.state_norm = state_norm
 
+        self.dim = dim
+        self.num_actions = num_actions
         self.dim_latent = dim_latent
         self.beta_actions = action_is_continuous
 
@@ -660,12 +722,14 @@ class Actor(Module):
 
         self.action_distr = BetaActionDistr() if self.beta_actions else CategoricalActionDistr()
 
-    def forward(
+    def latent(
         self,
         state,
-        latent,
-        temperature = 1.
-    ) -> Distribution:
+        latent
+    ) -> Tensor:
+        # hidden embedding right before the action projection -
+        # the dynamics in hidden_spr operate over this
+
         if exists(self.state_norm):
             with torch.no_grad():
                 self.state_norm.eval()
@@ -673,8 +737,15 @@ class Actor(Module):
 
         hidden = self.init_layer(state)
 
-        hidden = self.mlp(hidden, latent)
+        return self.mlp(hidden, latent)
 
+    def forward(
+        self,
+        state,
+        latent,
+        temperature = 1.
+    ) -> Distribution:
+        hidden = self.latent(state, latent)
         return self.action_distr(self.to_out(hidden), temperature = temperature)
 
 class Critic(Module):
@@ -724,9 +795,10 @@ class Critic(Module):
         self,
         state,
         latent,
-        old_values,
         target,
-        eps_clip = 0.4,
+        old_values = None,
+        clip_value = False,
+        eps_clip = 0.8,
         use_improved = True
     ):
 
@@ -736,6 +808,9 @@ class Critic(Module):
                 state = self.state_norm(state)
 
         logits = self.forward(state, latent, return_logits = True)
+
+        if not clip_value or not exists(old_values) or not exists(eps_clip):
+            return self.loss_fn(logits, target)
 
         value = self.maybe_bins_to_value(logits)
 
@@ -866,7 +941,6 @@ class LatentGenePool(Module):
         assert (frac_natural_selected + frac_elitism) < 1.
 
         self.dim_latent = dim_latent
-        self.num_latents = num_latents
         self.num_islands = num_islands
 
         latents_per_island = num_latents // num_islands
@@ -1177,8 +1251,9 @@ class Agent(Module):
             entropy_weight = .01,
             norm_advantages = True
         ),
+        clip_value = False,
         critic_loss_kwargs: dict = dict(
-            eps_clip = 0.4
+            eps_clip = 0.8
         ),
         use_spo = False, # Simple Policy Optimization - Xie et al. https://arxiv.org/abs/2401.16025v9
         use_improved_critic_loss = True,
@@ -1192,6 +1267,11 @@ class Agent(Module):
         diversity_discr_kwargs: dict = dict(dim = 64, depth = 2),
         diversity_discr_lr = 3e-4,
         diversity_discr_optim_kwargs: dict = dict(),
+        use_hidden_spr = False, # self-predictive representations over the actor's hidden embedding - https://arxiv.org/abs/2106.04799
+        hidden_spr_dim_action = 32,
+        hidden_spr_lr = 3e-4,
+        hidden_spr_weight = 1.0,
+        hidden_spr_ema_update = 0.99,
         get_fitness_scores: Callable[..., Tensor] = get_fitness_scores,
         wrap_with_accelerate: bool = True,
         accelerate_kwargs: dict = dict(),
@@ -1290,6 +1370,28 @@ class Agent(Module):
             self.diversity_discr = None
             self.diversity_discr_optim = None
 
+        self.clip_value = clip_value
+        self.critic_loss_kwargs = critic_loss_kwargs
+
+        # self-predictive representations (SPR)
+
+        self.use_hidden_spr = use_hidden_spr
+        self.hidden_spr_weight = hidden_spr_weight
+
+        if use_hidden_spr:
+            self.hidden_spr = HiddenSpr(
+                actor,
+                dim_hidden = actor.dim,
+                num_actions = actor.num_actions,
+                dim_action = hidden_spr_dim_action,
+            )
+
+            self.hidden_spr_optim = optim_klass(self.hidden_spr.online_parameters(), lr = hidden_spr_lr)
+            self.hidden_spr_ema_update = hidden_spr_ema_update
+        else:
+            self.hidden_spr = None
+            self.hidden_spr_optim = None
+
         self.register_buffer('has_diversity_discr_warmed_up', tensor(False))
         self.register_buffer('zero', tensor(0.))
 
@@ -1341,6 +1443,11 @@ class Agent(Module):
                     self.diversity_discr, self.diversity_discr_optim
                 )
 
+            if exists(self.hidden_spr):
+                self.hidden_spr, self.hidden_spr_optim = self.accelerate.prepare(
+                    self.hidden_spr, self.hidden_spr_optim
+                )
+
             if exists(self.latent_optim):
                 self.latent_optim = self.accelerate.prepare(self.latent_optim)
 
@@ -1373,6 +1480,7 @@ class Agent(Module):
 
     def save(self, path, overwrite = False):
         path = Path(path)
+        path.parent.mkdir(parents = True, exist_ok = True)
         unwrap = self.unwrap_model
         unwrap_optim = lambda opt: opt.optimizer if hasattr(opt, 'optimizer') else opt
 
@@ -1389,6 +1497,8 @@ class Agent(Module):
             critic_optim = unwrap_optim(self.critic_optim).state_dict(),
             latent_optim = unwrap_optim(self.latent_optim).state_dict() if exists(self.latent_optim) else None,
             diversity_discr_optim = unwrap_optim(self.diversity_discr_optim).state_dict() if self.use_diversity_discr else None,
+            hidden_spr = unwrap(self.hidden_spr).state_dict() if self.use_hidden_spr else None,
+            hidden_spr_optim = unwrap_optim(self.hidden_spr_optim).state_dict() if self.use_hidden_spr else None,
         )
 
         torch.save(pkg, str(path))
@@ -1409,13 +1519,18 @@ class Agent(Module):
             self.critic_ema.load_state_dict(pkg['critic_ema'])
 
         if 'latents' in pkg and exists(pkg['latents']):
-            self.latent_gene_pool.load_state_dict(pkg['latents'])
+            unwrap(self.latent_gene_pool).load_state_dict(pkg['latents'])
 
         if self.use_diversity_discr and 'diversity_discr' in pkg and exists(pkg['diversity_discr']):
             unwrap(self.diversity_discr).load_state_dict(pkg['diversity_discr'])
 
         if 'has_diversity_discr_warmed_up' in pkg:
             self.has_diversity_discr_warmed_up.copy_(tensor(pkg['has_diversity_discr_warmed_up']))
+
+        if self.use_hidden_spr and 'hidden_spr' in pkg and exists(pkg['hidden_spr']):
+            unwrap(self.hidden_spr).load_state_dict(pkg['hidden_spr'])
+        elif self.use_hidden_spr:
+            unwrap(self.hidden_spr).sync_targets_(unwrap(self.actor))
 
         unwrap_optim(self.actor_optim).load_state_dict(pkg['actor_optim'])
         unwrap_optim(self.critic_optim).load_state_dict(pkg['critic_optim'])
@@ -1425,6 +1540,9 @@ class Agent(Module):
 
         if self.use_diversity_discr and 'diversity_discr_optim' in pkg and exists(pkg['diversity_discr_optim']):
             unwrap_optim(self.diversity_discr_optim).load_state_dict(pkg['diversity_discr_optim'])
+
+        if self.use_hidden_spr and 'hidden_spr_optim' in pkg and exists(pkg['hidden_spr_optim']):
+            unwrap_optim(self.hidden_spr_optim).load_state_dict(pkg['hidden_spr_optim'])
 
     @move_input_tensors_to_device
     def get_actor_distribution(
@@ -1556,7 +1674,7 @@ class Agent(Module):
 
         valid_episode = episode_ids >= 0
 
-        dataset = TensorDataset(*[t[valid_episode] for t in (advantages, states, next_states, latent_gene_ids, actions, log_probs, values)])
+        dataset = TensorDataset(*[t[valid_episode] for t in (advantages, states, next_states, latent_gene_ids, actions, log_probs, values, dones)])
 
         dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
 
@@ -1576,7 +1694,8 @@ class Agent(Module):
                 latent_gene_ids,
                 actions,
                 log_probs,
-                old_values
+                old_values,
+                dones
             ) in dataloader:
 
                 if self.has_latent_genes:
@@ -1597,6 +1716,24 @@ class Agent(Module):
                     use_spo = self.use_spo
                 )
 
+                # self-predictive representation - predict the next hidden from
+                # the current hidden and action, against the ema target of the
+                # next state - only over non-terminal transitions
+
+                if self.use_hidden_spr:
+                    spr = self.unwrap_model(self.hidden_spr)
+
+                    hidden = self.unwrap_model(self.actor).latent(states, latents)
+                    predicted = spr.predict(hidden, actions)
+                    target = spr.target(next_states, latents)
+
+                    transitions = ~dones.bool()
+
+                    if transitions.any():
+                        spr_loss = (2. - F.cosine_similarity(predicted[transitions], target[transitions], dim = -1)).mean()
+
+                        actor_loss = actor_loss + self.hidden_spr_weight * spr_loss
+
                 actor_loss.backward()
 
                 if exists(self.has_grad_clip):
@@ -1605,6 +1742,10 @@ class Agent(Module):
                 self.actor_optim.step()
                 self.actor_optim.zero_grad()
 
+                if self.use_hidden_spr:
+                    self.hidden_spr_optim.step()
+                    self.hidden_spr_optim.zero_grad()
+
                 # learn critic with maybe classification loss
 
                 critic_loss = self.unwrap_model(self.critic).forward_for_loss(
@@ -1612,6 +1753,7 @@ class Agent(Module):
                     latents,
                     old_values = old_values,
                     target = advantages + old_values,
+                    clip_value = self.clip_value,
                     use_improved = self.use_improved_critic_loss,
                     **self.critic_loss_kwargs
                 )
@@ -1690,6 +1832,11 @@ class Agent(Module):
 
         if self.use_diversity_discr:
             self.has_diversity_discr_warmed_up.copy_(tensor(True))
+
+        # update the hidden spr ema targets once per learn_from
+
+        if self.use_hidden_spr:
+            self.unwrap_model(self.hidden_spr).ema_update(self.unwrap_model(self.actor), self.hidden_spr_ema_update)
 
         # apply evolution
 
@@ -1850,6 +1997,61 @@ MemoriesAndCumulativeRewards = namedtuple('MemoriesAndCumulativeRewards', [
     'cumulative_rewards' # Float['latent episodes']
 ])
 
+Slot = namedtuple('Slot', [
+    'latent_id',
+    'episode_id',
+    'latent',
+    'state',
+    'time',
+    'memories'
+])
+
+# rollout of episodes for each latent can be parallelized across the workers
+# of an env implementing the vectorized interface (`num_envs`, `reset_one`,
+# `step_batch`) - a gymnasium-style env (reset / step) is adapted to the
+# vectorized interface with a single worker
+
+def is_vectorized_env(env):
+    return all(hasattr(env, attr) for attr in ('num_envs', 'reset_one', 'step_batch'))
+
+class VectorizedEnvAdapter(Module):
+    def __init__(
+        self,
+        env
+    ):
+        super().__init__()
+        self.env = env
+        self.num_envs = 1
+
+    def reset_one(
+        self,
+        worker,
+        seed = None
+    ):
+        assert worker == 0
+
+        return self.env.reset(seed = seed)
+
+    def step_batch(
+        self,
+        actions,
+        worker_ids = None
+    ):
+        assert not exists(worker_ids) or list(worker_ids) == [0]
+
+        action = np.asarray(actions[0])
+        next_state, reward, terminated, truncated, *_ = self.env.step(action)
+
+        return (
+            np.asarray(next_state, dtype = np.float32)[None, ...],
+            np.asarray(reward, dtype = np.float32)[None],
+            np.asarray(terminated, dtype = bool)[None],
+            np.asarray(truncated, dtype = bool)[None]
+        )
+
+def to_vectorized_env(env):
+    return env if is_vectorized_env(env) else VectorizedEnvAdapter(env)
+
 class EPO(Module):
 
     def __init__(
@@ -1930,110 +2132,136 @@ class EPO(Module):
         memories: list[Memory] | None = None,
         fix_environ_across_latents = None
     ) -> MemoriesAndCumulativeRewards:
+        """rollout episodes for each latent - parallelized across the workers
+        of a vectorized env, or one episode at a time on a single worker for a
+        gymnasium-style env. when an episode ends, the next one from the
+        rollout generator is loaded into that worker"""
 
         fix_environ_across_latents = default(fix_environ_across_latents, self.fix_environ_across_latents)
 
+        env = to_vectorized_env(env)
+        num_envs = env.num_envs
+
         self.agent.eval()
 
-        invalid_episode = tensor(-1) # will use `episode_id` value of `-1` for the `next_value`, needed for not discarding last reward for generalized advantage estimate
+        invalid_episode = tensor(-1) # bootstrap transitions carry this id, to be discarded when learning
+        num_episodes = self.num_latents * self.episodes_per_latent
 
-        if not exists(memories):
-            memories = []
+        memories = memories if exists(memories) else []
 
         rewards_per_latent_episode = torch.zeros((self.num_latents, self.episodes_per_latent), device = self.device)
 
-        rollout_gen = self.rollouts_for_machine(fix_environ_across_latents)
+        rollout_gen = iter(self.rollouts_for_machine(fix_environ_across_latents))
 
-        for latent_id, episode_id, maybe_seed in tqdm(rollout_gen, desc = 'rollout', disable = self.agent.quiet or not self.agent.is_main_process):
+        # slots - the episode each worker is currently rolling out
 
-            time = 0
+        slots: list[Slot | None] = [None] * num_envs
 
-            # initial state
+        def fill_slot(i):
+            rollout = next(rollout_gen, None)
+            if rollout is None:
+                return
 
-            reset_kwargs = dict()
-
-            if fix_environ_across_latents:
-                reset_kwargs.update(seed = maybe_seed)
-
-            state, _ = interface_torch_numpy(env.reset, device = self.device)(**reset_kwargs)
-
-            # get latent from pool
+            latent_id, episode_id, maybe_seed = rollout
 
             latent = self.agent.unwrapped_latent_gene_pool(latent_id = latent_id) if self.agent.has_latent_genes else None
 
-            # until maximum episode length
+            seed = maybe_seed if fix_environ_across_latents else None
+            state, _ = interface_torch_numpy(env.reset_one, device = self.device)(i, seed = seed)
 
-            done = tensor(False)
+            slots[i] = Slot(latent_id, episode_id, latent, state, 0, [])
 
-            while time < self.max_episode_length and not done:
+        for i in range(num_envs):
+            fill_slot(i)
 
-                # sample action
+        pbar = tqdm(total = num_episodes, desc = 'rollout', disable = self.agent.quiet or not self.agent.is_main_process)
 
-                action, log_prob = temp_batch_dim(self.agent.get_actor_actions)(state, latent = latent, sample = True, temperature = self.action_sample_temperature, use_unwrapped_model = True)
+        # each iteration, batch all active slots through the actor and critic,
+        # then step the env - slots that finish are refilled and the batch
+        # stays full until all episodes have been rolled out
 
-                # values
+        while num_episodes > 0:
+            active = [i for i, slot in enumerate(slots) if exists(slot)]
 
-                value = temp_batch_dim(self.agent.get_critic_values)(state, latent = latent, use_ema_if_available = True, use_unwrapped_model = True)
+            obs = stack([slots[i].state for i in active])
+            latents = stack([slots[i].latent for i in active]) if self.agent.has_latent_genes else None
 
-                # get the next state, action, and reward
+            actions, log_probs = self.agent.get_actor_actions(obs, latent = latents, sample = True, temperature = self.action_sample_temperature, use_unwrapped_model = True)
+            values = self.agent.get_critic_values(obs, latent = latents, use_ema_if_available = True, use_unwrapped_model = True)
 
-                next_state, reward, terminated, truncated, _ = interface_torch_numpy(env.step, device = self.device)(action)
+            next_obs, rewards, terminated, truncated = env.step_batch(actions.cpu().numpy(), worker_ids = active)[:4]
 
-                # diversity reward
+            rewards = from_numpy(np.asarray(rewards)).float().to(self.device)
+            terminated = from_numpy(np.asarray(terminated)).to(self.device)
+            truncated = from_numpy(np.asarray(truncated)).to(self.device)
+
+            for k, worker in enumerate(active):
+                slot = slots[worker]
+
+                latent_id, episode_id, latent, state = slot.latent_id, slot.episode_id, slot.latent, slot.state
+
+                next_state = from_numpy(np.array(next_obs[k])).float().to(self.device)
+
+                reward, terminated_at, truncated_at = rewards[k], terminated[k], truncated[k]
+
+                # maybe diversity reward for the latent
 
                 if self.agent.use_diversity_discr and self.agent.has_diversity_discr_warmed_up.item():
                     with torch.no_grad():
-                        diversity_discr = self.agent.unwrap_model(self.agent.diversity_discr)
-                        diversity_discr.eval()
+                        logits = self.agent.unwrap_model(self.agent.diversity_discr)(rearrange(state, '... -> 1 ...'), rearrange(next_state, '... -> 1 ...'))
 
-                        logits = diversity_discr(rearrange(state, '... -> 1 ...'), rearrange(next_state, '... -> 1 ...'))
-                        log_probs = logits.log_softmax(dim=-1)
+                        latent_log_probs = logits.log_softmax(dim = -1)
+                        diversity_reward = latent_log_probs[0, latent_id] + math.log(self.agent.num_latents)
 
-                        diversity_reward = log_probs[0, latent_id] + log(tensor(self.agent.num_latents))
+                        reward = reward + self.diversity_reward_weight * diversity_reward.item()
 
-                        reward = reward + diversity_reward * self.diversity_reward_weight
-
-                done = truncated or terminated
-
-                # update cumulative rewards per latent, to be used as default fitness score
-
-                rewards_per_latent_episode[latent_id, episode_id] += reward
-
-                # store memories
+                done = truncated_at or terminated_at
 
                 memory = Memory(
                     tensor(episode_id),
                     state,
                     next_state,
                     tensor(latent_id),
-                    action,
-                    log_prob,
+                    actions[k],
+                    log_probs[k],
                     reward,
-                    value,
-                    terminated
+                    values[k],
+                    terminated_at
                 )
 
                 memory = Memory(*tuple(t.cpu() for t in memory))
 
-                memories.append(memory)
+                slot.memories.append(memory)
 
-                state = next_state
+                rewards_per_latent_episode[latent_id, episode_id] += reward
 
-                time += 1
+                # episode is done - bootstrap value if truncated, then refill
 
-            if not terminated:
-                # add bootstrap value if truncated
+                if not done and slot.time + 1 < self.max_episode_length:
+                    slots[worker] = slot._replace(state = next_state, time = slot.time + 1)
+                    continue
 
-                next_value = temp_batch_dim(self.agent.get_critic_values)(next_state, latent = latent, use_ema_if_available = True, use_unwrapped_model = True)
+                if not terminated_at:
+                    next_value = temp_batch_dim(self.agent.get_critic_values)(next_state, latent = latent, use_ema_if_available = True, use_unwrapped_model = True)
 
-                memory_for_gae = memory._replace(
-                    episode_id = invalid_episode,
-                    reward = next_value.cpu(),
-                    value = next_value.cpu(),
-                    done = tensor(True)
-                )
+                    memory = memory._replace(
+                        episode_id = invalid_episode,
+                        reward = next_value.cpu(),
+                        value = next_value.cpu(),
+                        done = tensor(True)
+                    )
 
-                memories.append(memory_for_gae)
+                    slot.memories.append(memory)
+
+                memories.extend(slot.memories)
+
+                num_episodes -= 1
+                pbar.update(1)
+
+                slots[worker] = None
+                fill_slot(worker)
+
+        pbar.close()
 
         return MemoriesAndCumulativeRewards(
             memories = memories,
