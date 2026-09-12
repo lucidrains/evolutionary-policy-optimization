@@ -15,15 +15,15 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from accelerate import Accelerator
-from adam_atan2_pytorch import AdoptAtan2
+from torch.optim import AdamW
 from assoc_scan import AssocScan
 from einops import einsum, rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 from ema_pytorch import EMA
 from hl_gauss_pytorch import HLGaussLayer
+from mean_conc_beta import Beta
 from torch import Tensor, cat, from_numpy, is_tensor, nn, stack, tensor
-from torch.distributions import Beta, Categorical, Distribution
-
+from torch.distributions import Categorical, Distribution
 from torch.nn import Linear, Module, ModuleList
 from torch.utils._pytree import tree_map
 from torch.utils.data import DataLoader, TensorDataset
@@ -545,7 +545,7 @@ class DiversityDiscr(Module):
 
 # action distributions - the actor always returns a `Distribution`, either
 # categorical (discrete) or beta mean-conc (continuous). beta is defined over
-# (0, 1) - rescale to the env's action range at the interface
+# (-1, 1) - multiplied by some constant usually (e.g. 0.4) for the env action range
 
 class CategoricalActionDistr(Module):
     def forward(self, logits, temperature = 1.):
@@ -553,58 +553,6 @@ class CategoricalActionDistr(Module):
             logits = logits / temperature
 
         return Categorical(logits = logits)
-
-class BetaActionDistr(Module):
-    def __init__(
-        self,
-        init_conc = 2.,
-        min_conc = 0.,
-        eps = 1e-5
-    ):
-        super().__init__()
-        assert init_conc > min_conc
-
-        self.init_conc = init_conc
-        self.min_conc = min_conc
-        self.eps = eps
-
-        # softplus offset so the concentration at raw_conc = 0 is exactly init_conc
-
-        self.raw_init_conc = math.log(math.expm1(init_conc - min_conc))
-
-    def mean(self, params):
-        # the beta mean is exactly (tanh(raw_mean) + 1) / 2 by construction
-
-        raw_mean, _ = params.unbind(dim = -1)
-        return ((torch.tanh(raw_mean) + 1.) * 0.5).clamp(min = self.eps, max = 1. - self.eps)
-
-    def entropy(self, params, temperature = 1.):
-        # entropy is over the rescaled (2x - 1) in [-1, 1], with log 2 jacobian
-        # adjustment for the differential entropy of an affine transform
-
-        distr = self.forward(params, temperature = temperature)
-        return distr.entropy() + math.log(2.)
-
-    def forward(self, params, temperature = 1.):
-        _, raw_conc = params.unbind(dim = -1)
-
-        mean = self.mean(params)
-
-        conc = F.softplus(raw_conc + self.raw_init_conc) + self.min_conc
-
-        # concentration floor - unimodal (alpha > 1 and beta > 1), mean kept exact
-
-        conc = conc + 1. / torch.minimum(mean, 1. - mean).clamp(min = self.eps)
-
-        # temperature scales the concentration - lower temperature, sharper policy
-
-        if temperature > 0. and temperature != 1.:
-            conc = conc / temperature
-
-        alpha = mean * conc
-        beta = (1. - mean) * conc
-
-        return Beta(alpha, beta)
 
 # self-predictive representations (SPR) over the actor's hidden embedding
 
@@ -689,6 +637,7 @@ class Actor(Module):
         state_norm: StateNorm | None = None,
         dim_latent = 0,
         action_is_continuous = False, # continuous control - beta policy
+        beta_kwargs: dict = dict(),
     ):
         super().__init__()
 
@@ -720,7 +669,7 @@ class Actor(Module):
                 nn.Linear(dim, num_actions, bias = False),
             )
 
-        self.action_distr = BetaActionDistr() if self.beta_actions else CategoricalActionDistr()
+        self.action_distr = Beta(**beta_kwargs) if self.beta_actions else CategoricalActionDistr()
 
     def latent(
         self,
@@ -1079,6 +1028,8 @@ class LatentGenePool(Module):
         should_update_per_island = self.should_run_genetic_algorithm(fitness)
 
         if not should_update_per_island.any():
+            self.advance_step_()
+
             if inplace:
                 return False, None
 
@@ -1229,13 +1180,13 @@ class Agent(Module):
         actor: Actor,
         critic: Critic,
         latent_gene_pool: LatentGenePool | None,
-        optim_klass = AdoptAtan2,
+        optim_klass = AdamW,
         state_norm: StateNorm | None = None,
         actor_lr = 8e-4,
         critic_lr = 8e-4,
         latent_lr = 1e-5,
-        actor_weight_decay = 5e-4,
-        critic_weight_decay = 5e-4,
+        actor_weight_decay = 0.,
+        critic_weight_decay = 0.,
         diversity_aux_loss_weight = 0.,
         use_critic_ema = True,
         critic_ema_beta = 0.95,

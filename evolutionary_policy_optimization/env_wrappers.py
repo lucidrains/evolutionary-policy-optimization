@@ -5,9 +5,8 @@ from torch.nn import Module
 
 from evolutionary_policy_optimization.epo import Agent, create_agent, exists
 
-
-def rescale_from_to(x, from_range = (0., 1.), to_range = (-1., 1.)):
-    # e.g. beta actions on (0, 1) -> the env's action bounds
+def rescale_from_to(x, from_range = (-1., 1.), to_range = (-1., 1.)):
+    # e.g. beta actions on (-1, 1) -> the env's action bounds
 
     from_low, from_high = from_range
     to_low, to_high = to_range
@@ -36,7 +35,7 @@ class GymnasiumEnvWrapper(Module):
         return self.env.reset(*args, **kwargs)
 
     def step(self, actions, *args, **kwargs):
-        # beta lives on (0, 1) - rescale to the env's bounds at the interface
+        # continuous actions are on (-1, 1) - rescale to env bounds at interface
 
         if exists(self.rescale_to):
             actions = rescale_from_to(actions, to_range = self.rescale_to)

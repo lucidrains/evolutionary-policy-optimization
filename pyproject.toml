@@ -1,12 +1,12 @@
 [project]
 name = "evolutionary-policy-optimization"
-version = "0.3.1"
+version = "0.3.5"
 description = "EPO - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
 ]
 readme = "README.md"
-requires-python = ">= 3.9"
+requires-python = ">= 3.10"
 license = { file = "LICENSE" }
 keywords = [
     'artificial intelligence',
@@ -30,6 +30,7 @@ dependencies = [
     'einops>=0.8.1',
     'ema-pytorch>=0.7.7',
     'hl-gauss-pytorch>=0.2.8',
+    'mean-conc-beta>=0.0.7',
     'torch>=2.2',
     'tqdm',
     "x-mlps-pytorch>=0.3.0",

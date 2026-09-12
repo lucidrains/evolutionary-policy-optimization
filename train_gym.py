@@ -14,10 +14,11 @@
 # [tool.uv.sources]
 # evolutionary-policy-optimization = { path = ".", editable = true }
 # ///
- 
+
 import fire
 import numpy as np
 from collections import deque
+from pathlib import Path
 from shutil import rmtree
 
 import gymnasium as gym
@@ -27,6 +28,12 @@ from evolutionary_policy_optimization import (
     EPO,
     GymnasiumEnvWrapper
 )
+
+def exists(v):
+    return v is not None
+
+def default(v, d):
+    return v if exists(v) else d
 
 ENV_CONFIGS = dict(
     cartpole = dict(
@@ -43,7 +50,7 @@ ENV_CONFIGS = dict(
     ),
     pendulum = dict(
         env_name = 'Pendulum-v1',
-        target_reward = -150.,
+        target_reward = -200.,
         max_episode_length = 200,
         episodes_per_latent = 2,
         actor_dim = 64,
@@ -52,6 +59,24 @@ ENV_CONFIGS = dict(
         critic_mlp_depth = 3,
         hl_gauss_min = -2500.,
         hl_gauss_max = 0.,
+        actor_kwargs = dict(
+            beta_kwargs = dict(
+                pos_fn = 'softplus',
+                init_conc = 2.,
+            )
+        )
+    ),
+    inverted_pendulum = dict(
+        env_name = 'InvertedPendulum-v5',
+        target_reward = 500.,
+        max_episode_length = 1000,
+        episodes_per_latent = 2,
+        actor_dim = 64,
+        actor_mlp_depth = 2,
+        critic_dim = 128,
+        critic_mlp_depth = 3,
+        hl_gauss_min = 0.,
+        hl_gauss_max = 1000.,
     ),
     lunar = dict(
         env_name = 'LunarLander-v3',
@@ -73,12 +98,15 @@ def train(
     num_learning_cycles = 1000,
     target_reward = None,
     num_episodes_for_target = 20,
-    learning_epochs = 2,
-    use_wandb = False
+    learning_epochs: int | None = None,
+    use_wandb = False,
+    resume = False
 ):
     assert env_name in ENV_CONFIGS, f'env_name must be one of {tuple(ENV_CONFIGS.keys())}'
 
     config = ENV_CONFIGS[env_name]
+
+    learning_epochs = default(learning_epochs, config.get('learning_epochs', 2))
 
     accelerator_kwargs = dict(cpu = cpu)
 
@@ -110,7 +138,7 @@ def train(
 
     # agent
 
-    agent = env.to_epo_agent(
+    agent_kwargs = dict(
         num_latents = 8,
         dim_latent = 32,
         actor_dim = config['actor_dim'],
@@ -130,13 +158,17 @@ def train(
                 num_bins = 250,
             ),
         ),
-        actor_optim_kwargs = dict(
-            cautious_factor = 0.1,
-        ),
-        critic_optim_kwargs = dict(
-            cautious_factor = 0.1,
-        ),
+        actor_kwargs = config.get('actor_kwargs', dict()),
     )
+
+    agent_kwargs.update(config.get('agent_kwargs', dict()))
+
+    agent = env.to_epo_agent(**agent_kwargs)
+
+    checkpoint_path = f'./{env_name}_agent.pt'
+
+    if resume and Path(checkpoint_path).exists():
+        agent.load(checkpoint_path)
 
     epo = EPO(
         agent,
@@ -166,16 +198,18 @@ def train(
             recent_rewards.append(r)
 
         avg_reward = np.mean(recent_rewards)
+        best_latent_reward = rewards.mean(dim = -1).max().item()
 
         pbar.set_postfix(
             avg_reward = f"{avg_reward:.2f}",
+            best_reward = f"{best_latent_reward:.2f}",
             fitness_var = f"{fitness_var:.2f}"
         )
 
         if use_wandb:
-            accelerator.log(dict(avg_reward = avg_reward, fitness_var = fitness_var), step = cycle)
+            accelerator.log(dict(avg_reward = avg_reward, best_reward = best_latent_reward, fitness_var = fitness_var), step = cycle)
 
-        if len(recent_rewards) == num_episodes_for_target and avg_reward >= target_reward:
+        if len(recent_rewards) == num_episodes_for_target and (avg_reward >= target_reward or best_latent_reward >= target_reward):
             accelerator.print(f'\ntarget reward of {target_reward} reached!')
             break
 

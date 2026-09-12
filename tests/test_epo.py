@@ -1,18 +1,10 @@
 import pytest
-
 import torch
-from torch.distributions import Beta, Categorical
+from torch.distributions import Categorical, TransformedDistribution
 
-from evolutionary_policy_optimization.epo import (
-    LatentGenePool,
-    Actor,
-    Critic,
-    create_agent,
-    shrink_and_perturb_,
-    EPO
-)
-
+from evolutionary_policy_optimization.epo import EPO, Actor, Critic, LatentGenePool, create_agent, shrink_and_perturb_
 from evolutionary_policy_optimization.mock_env import Env, VectorEnv
+
 
 @pytest.mark.parametrize('latent_ids', (2, (2, 4)))
 @pytest.mark.parametrize('num_islands', (1, 4))
@@ -56,7 +48,7 @@ def test_readme(
 
 @pytest.mark.parametrize(
     'action_is_continuous, distribution_type',
-    ((False, Categorical), (True, Beta))
+    ((False, Categorical), (True, TransformedDistribution))
 )
 def test_actor_returns_distribution(action_is_continuous, distribution_type):
     actor = Actor(
@@ -127,7 +119,7 @@ def test_e2e_with_mock_env(
     use_improved_critic_loss,
     shrink_and_perturb_every
 ):
-    from evolutionary_policy_optimization import create_agent, EPO, Env
+    from evolutionary_policy_optimization import EPO, Env, create_agent
 
     agent = create_agent(
         dim_state = 512,
@@ -172,29 +164,27 @@ def test_e2e_with_mock_env(
     shrink_and_perturb_(agent)
 
 
-def test_beta_entropy_adjusted_for_shift():
+def test_mean_conc_beta_integration():
     import math
-    from torch.distributions import Beta as TorchBeta
-    from evolutionary_policy_optimization import BetaActionDistr
 
-    distr_mod = BetaActionDistr()
+    from evolutionary_policy_optimization import Actor, Beta
+
+    beta = Beta()
     params = torch.randn(4, 6, 2)
+    distr = beta(params)
 
-    entropy = distr_mod.entropy(params)
+    # entropy directly on distr matches base_dist entropy + log(2)
+    base_entropy = distr.base_dist.entropy()
+    assert torch.allclose(distr.entropy(), base_entropy + math.log(2.), atol = 1e-5)
 
-    # compute raw PyTorch beta entropy for comparison
-    mean = distr_mod.mean(params)
-    _, raw_conc = params.unbind(dim = -1)
-    conc = torch.nn.functional.softplus(raw_conc + distr_mod.raw_init_conc) + distr_mod.min_conc
-    conc = conc + 1. / torch.minimum(mean, 1. - mean).clamp(min = distr_mod.eps)
-    alpha = mean * conc
-    beta = (1. - mean) * conc
-    raw_entropy = TorchBeta(alpha, beta).entropy()
-
-    # the adjusted entropy from BetaActionDistr.entropy must equal raw entropy + log(2)
-    assert torch.allclose(entropy, raw_entropy + math.log(2.), atol = 1e-5)
-    # raw distribution forward returns standard PyTorch Beta
-    assert torch.allclose(distr_mod(params).entropy(), raw_entropy, atol = 1e-5)
+    # actor with continuous actions
+    actor = Actor(dim_state = 8, dim = 16, mlp_depth = 2, num_actions = 3, action_is_continuous = True)
+    distr = actor(torch.randn(4, 8), None)
+    sample = distr.sample()
+    assert ((sample >= -1.) & (sample <= 1.)).all()
+    assert distr.log_prob(sample).shape == (4, 3)
+    assert distr.mean.shape == (4, 3)
+    assert distr.entropy().shape == (4, 3)
 
 def test_e2e_with_spr():
     agent = create_agent(
@@ -442,3 +432,58 @@ def test_e2e_vectorized_env(action_is_continuous):
     # 3. save and load
     agent.save('./agent_vec.pt', overwrite = True)
     agent.load('./agent_vec.pt')
+
+
+def test_continuous_beta_details():
+    from evolutionary_policy_optimization import Beta, create_agent
+
+    agent = create_agent(
+        dim_state = 16,
+        num_latents = 64,
+        dim_latent = 8,
+        actor_num_actions = 3,
+        actor_dim = 16,
+        actor_mlp_depth = 2,
+        critic_dim = 16,
+        critic_mlp_depth = 2,
+        action_is_continuous = True,
+        wrap_with_accelerate = False,
+    )
+
+    state = torch.randn(4, 16)
+
+    # 1. greedy action (sample = False)
+    actions = agent.get_actor_actions(state, latent_id = 0, sample = False)
+    assert actions.shape == (4, 3)
+    assert ((actions >= -1.) & (actions <= 1.)).all()
+
+    # 2. sampled action (sample = True)
+    actions_sample, log_probs = agent.get_actor_actions(state, latent_id = 0, sample = True)
+    assert actions_sample.shape == (4, 3)
+    assert log_probs.shape == (4,)
+    assert ((actions_sample >= -1.) & (actions_sample <= 1.)).all()
+
+    # 3. temperature support
+    actions_temp, _ = agent.get_actor_actions(state, latent_id = 0, sample = True, temperature = 0.5)
+    assert actions_temp.shape == (4, 3)
+
+    # 4. scaling to env bounds by multiplying constant
+    scaled = actions * 0.4
+    assert scaled.shape == (4, 3)
+    assert ((scaled >= -0.4) & (scaled <= 0.4)).all()
+
+    # 5. beta_kwargs pass-through
+    agent_custom = create_agent(
+        dim_state = 16,
+        num_latents = 64,
+        dim_latent = 8,
+        actor_num_actions = 3,
+        actor_dim = 16,
+        actor_mlp_depth = 2,
+        critic_dim = 16,
+        critic_mlp_depth = 2,
+        action_is_continuous = True,
+        actor_kwargs = dict(beta_kwargs = dict(pos_fn = 'softplus')),
+        wrap_with_accelerate = False,
+    )
+    assert agent_custom.actor.action_distr.pos_fn == 'softplus'
