@@ -306,6 +306,16 @@ That's it
 ```
 
 ```bibtex
+@inproceedings{Sharma2020DynamicsAwareUD,
+    title   = {Dynamics-Aware Unsupervised Discovery of Skills},
+    author  = {Archit Sharma and Shixiang Gu and Sergey Levine and Vikash Kumar and Karol Hausman},
+    booktitle = {International Conference on Learning Representations},
+    year    = {2020},
+    url     = {https://arxiv.org/abs/1907.01657}
+}
+```
+
+```bibtex
 @article{Zhu2025Hybrid,
     author  = {Zhu, Zimo and Yu, Chuanqiang and Wang, Junti},
     title   = {A Hybrid Genetic Algorithm and Proximal Policy Optimization System for Efficient Multi-Agent Task Allocation},

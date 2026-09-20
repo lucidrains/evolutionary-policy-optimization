@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.nn.functional as F
 from torch.distributions import Categorical, TransformedDistribution
 
 from evolutionary_policy_optimization.epo import EPO, Actor, Critic, LatentGenePool, create_agent, shrink_and_perturb_
@@ -377,6 +378,81 @@ def test_diversity_discr_rollout_no_grad():
     for m in result.memories:
         assert m.reward.grad_fn is None
         assert not m.reward.requires_grad
+
+def test_diayn_and_dads_diversity_discr():
+    from evolutionary_policy_optimization import DiversityDiscr
+
+    # DIAYN: state only (time_gap = 0)
+    discr_diayn = DiversityDiscr(
+        dim_state = 16,
+        num_latents = 4,
+        dim = 32,
+        depth = 2,
+        time_gap = 0
+    )
+
+    state = torch.randn(8, 16)
+    logits_diayn = discr_diayn(state)
+    assert logits_diayn.shape == (8, 4)
+
+    loss_diayn = F.cross_entropy(logits_diayn, torch.randint(0, 4, (8,)))
+    loss_diayn.backward()
+    assert discr_diayn.state_proj.weight.grad is not None
+
+    # DADS: state transition (time_gap = 1)
+    discr_dads = DiversityDiscr(
+        dim_state = 16,
+        num_latents = 4,
+        dim = 32,
+        depth = 2,
+        time_gap = 1
+    )
+
+    next_state = state + torch.randn(8, 16) * 0.1
+    logits_dads = discr_dads(state, next_state)
+    assert logits_dads.shape == (8, 4)
+
+    loss_dads = F.cross_entropy(logits_dads, torch.randint(0, 4, (8,)))
+    loss_dads.backward()
+    assert discr_dads.state_proj.weight.grad is not None
+
+
+@pytest.mark.parametrize('diversity_time_gap', (0, 1, 2))
+def test_e2e_learning_cycle_with_diversity_discr(diversity_time_gap):
+    agent = create_agent(
+        dim_state = 16,
+        num_latents = 4,
+        dim_latent = 8,
+        actor_num_actions = 2,
+        actor_dim = 16,
+        actor_mlp_depth = 2,
+        critic_dim = 16,
+        critic_mlp_depth = 2,
+        use_critic_ema = False,
+        use_diversity_discr = True,
+        diversity_time_gap = diversity_time_gap,
+        latent_gene_pool_kwargs = dict(
+            frac_natural_selected = 0.75,
+            frac_tournaments = 0.9
+        ),
+        wrap_with_accelerate = False,
+    )
+
+    epo = EPO(
+        agent,
+        episodes_per_latent = 2,
+        max_episode_length = 6,
+        diversity_reward_weight = 0.5,
+    )
+
+    env = Env((16,))
+    # after 1 cycle, discriminator should be warmed up
+    epo(env, num_learning_cycles = 1)
+    assert agent.has_diversity_discr_warmed_up.item()
+
+    # after 2nd cycle, GA step runs (apply_genetic_algorithm_every=2) which resets warmup
+    epo(env, num_learning_cycles = 1)
+    assert not agent.has_diversity_discr_warmed_up.item()
 
 
 @pytest.mark.parametrize('action_is_continuous', (False, True))

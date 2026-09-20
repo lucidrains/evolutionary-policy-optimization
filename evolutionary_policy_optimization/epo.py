@@ -513,7 +513,7 @@ class MLP(Module):
 
         return self.final_lime(x, prev_layer_inputs)
 
-# discriminator for predicting latent code from states and actions (DIAYN - Eysenbach et al. 2018)
+# discriminator for predicting latent code from states or state transitions (DIAYN / DADS)
 
 class DiversityDiscr(Module):
     def __init__(
@@ -521,15 +521,19 @@ class DiversityDiscr(Module):
         dim_state,
         num_latents,
         dim = 64,
-        depth = 2
+        depth = 2,
+        time_gap = 1
     ):
         super().__init__()
+        self.time_gap = time_gap
+        self.state_transition = time_gap > 0
+
         self.state_proj = nn.Linear(dim_state, dim)
 
         self.net = AttnResidualNormedMLP(
             dim = dim,
             depth = depth,
-            dim_in = dim * 2,
+            dim_in = dim * 2 if self.state_transition else dim,
             dim_out = num_latents
         )
 
@@ -538,8 +542,12 @@ class DiversityDiscr(Module):
             if isinstance(module, (nn.Linear, nn.LayerNorm, nn.RMSNorm)):
                 module.reset_parameters()
 
-    def forward(self, state, next_state):
+    def forward(self, state, next_state = None):
         state_embed = self.state_proj(state)
+
+        if not self.state_transition or not exists(next_state):
+            return self.net(state_embed)
+
         next_state_embed = self.state_proj(next_state)
         return self.net((state_embed, next_state_embed))
 
@@ -1215,6 +1223,7 @@ class Agent(Module):
         critic_optim_kwargs: dict = dict(),
         latent_optim_kwargs: dict = dict(),
         use_diversity_discr = False,
+        diversity_time_gap = 1, # 0 for DIAYN (state only), >= 1 for DADS (state transition with given time gap)
         diversity_discr_kwargs: dict = dict(dim = 64, depth = 2),
         diversity_discr_lr = 3e-4,
         diversity_discr_optim_kwargs: dict = dict(),
@@ -1305,14 +1314,16 @@ class Agent(Module):
         # diversity discriminator
 
         self.use_diversity_discr = use_diversity_discr
+        self.diversity_time_gap = diversity_time_gap
 
         if use_diversity_discr:
-            assert exists(latent_gene_pool), 'latent_gene_pool must be present to use DIAYN'
+            assert exists(latent_gene_pool), 'latent_gene_pool must be present to use DIAYN / DADS'
             dim_state = actor.init_layer[0].in_features
 
             self.diversity_discr = DiversityDiscr(
                 dim_state = dim_state,
                 num_latents = latent_gene_pool.num_latents,
+                time_gap = diversity_time_gap,
                 **diversity_discr_kwargs
             )
 
@@ -1443,6 +1454,7 @@ class Agent(Module):
             critic_ema = self.critic_ema.state_dict() if self.use_critic_ema else None,
             latents = unwrap(self.latent_gene_pool).state_dict() if self.has_latent_genes else None,
             diversity_discr = unwrap(self.diversity_discr).state_dict() if self.use_diversity_discr else None,
+            diversity_time_gap = self.diversity_time_gap,
             has_diversity_discr_warmed_up = self.has_diversity_discr_warmed_up.item(),
             actor_optim = unwrap_optim(self.actor_optim).state_dict(),
             critic_optim = unwrap_optim(self.critic_optim).state_dict(),
@@ -1474,6 +1486,9 @@ class Agent(Module):
 
         if self.use_diversity_discr and 'diversity_discr' in pkg and exists(pkg['diversity_discr']):
             unwrap(self.diversity_discr).load_state_dict(pkg['diversity_discr'])
+
+        if 'diversity_time_gap' in pkg:
+            self.diversity_time_gap = pkg['diversity_time_gap']
 
         if 'has_diversity_discr_warmed_up' in pkg:
             self.has_diversity_discr_warmed_up.copy_(tensor(pkg['has_diversity_discr_warmed_up']))
@@ -1722,7 +1737,8 @@ class Agent(Module):
                 diversity_discr_loss = self.zero
 
                 if self.use_diversity_discr:
-                    diversity_discr_logits = self.diversity_discr(states, next_states)
+                    discr_inp = (states,) if self.diversity_time_gap == 0 else (states, next_states)
+                    diversity_discr_logits = self.diversity_discr(*discr_inp)
                     diversity_discr_loss = F.cross_entropy(diversity_discr_logits, latent_gene_ids)
 
                     diversity_discr_loss.backward()
@@ -1878,6 +1894,7 @@ def create_agent(
     use_critic_ema = True,
     use_state_norm = False,
     action_is_continuous = False, # continuous control - beta policy
+    diversity_time_gap = 1,
     latent_gene_pool_kwargs: dict = dict(),
     actor_kwargs: dict = dict(),
     critic_kwargs: dict = dict(),
@@ -1923,6 +1940,7 @@ def create_agent(
         state_norm = state_norm,
         latent_gene_pool = latent_gene_pool,
         use_critic_ema = use_critic_ema,
+        diversity_time_gap = diversity_time_gap,
         **kwargs
     )
 
@@ -2159,7 +2177,16 @@ class EPO(Module):
 
                 if self.agent.use_diversity_discr and self.agent.has_diversity_discr_warmed_up.item():
                     with torch.no_grad():
-                        logits = self.agent.unwrap_model(self.agent.diversity_discr)(rearrange(state, '... -> 1 ...'), rearrange(next_state, '... -> 1 ...'))
+                        discr = self.agent.unwrap_model(self.agent.diversity_discr)
+                        time_gap = self.agent.diversity_time_gap
+
+                        if time_gap == 0:
+                            logits = discr(rearrange(state, '... -> 1 ...'))
+                        elif time_gap == 1 or len(slot.memories) < (time_gap - 1):
+                            logits = discr(rearrange(state, '... -> 1 ...'), rearrange(next_state, '... -> 1 ...'))
+                        else:
+                            past_state = slot.memories[-(time_gap - 1)].state
+                            logits = discr(rearrange(past_state, '... -> 1 ...'), rearrange(next_state, '... -> 1 ...'))
 
                         latent_log_probs = logits.log_softmax(dim = -1)
                         diversity_reward = latent_log_probs[0, latent_id] + math.log(self.agent.num_latents)
@@ -2183,6 +2210,11 @@ class EPO(Module):
                 memory = Memory(*tuple(t.cpu() for t in memory))
 
                 slot.memories.append(memory)
+
+                if self.agent.use_diversity_discr and self.agent.diversity_time_gap > 1:
+                    time_gap = self.agent.diversity_time_gap
+                    if len(slot.memories) >= time_gap:
+                        slot.memories[-time_gap] = slot.memories[-time_gap]._replace(next_state = next_state)
 
                 rewards_per_latent_episode[latent_id, episode_id] += reward
 
