@@ -174,3 +174,15 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# microduck runs / artifacts
+checkpoints*/
+experiments/
+videos*/
+recordings/
+wandb/
+scratch/
+data/
+*.pt
+*.mp4
+*.log

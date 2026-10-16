@@ -52,6 +52,20 @@ def divisible_by(num, den):
 def to_device(inp, device):
     return tree_map(lambda t: t.to(device) if is_tensor(t) else t, inp)
 
+class ShuffledBatches:
+    # fresh permutation on every pass
+
+    def __init__(self, fields, batch_size):
+        self.fields = fields
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        perm = torch.randperm(self.fields[0].shape[0])
+
+        for i in range(0, len(perm), self.batch_size):
+            b = perm[i:i + self.batch_size]
+            yield [field[b] for field in self.fields]
+
 def maybe(fn):
 
     @wraps(fn)
@@ -1234,6 +1248,7 @@ class Agent(Module):
         hidden_spr_ema_update = 0.99,
         get_fitness_scores: Callable[..., Tensor] = get_fitness_scores,
         wrap_with_accelerate: bool = True,
+        use_dataloader = False,
         accelerate_kwargs: dict = dict(),
         accelerator = None,
         quiet: bool = False,
@@ -1245,6 +1260,7 @@ class Agent(Module):
         # hf accelerate
 
         self.wrap_with_accelerate = wrap_with_accelerate
+        self.use_dataloader = use_dataloader
 
         if wrap_with_accelerate:
             self.accelerate = accelerator if exists(accelerator) else Accelerator(**accelerate_kwargs)
@@ -1592,13 +1608,12 @@ class Agent(Module):
         epochs = 2
 
     ):
-        memories_and_cumulative_rewards = to_device(memories_and_cumulative_rewards, self.device)
-
         memories_list, rewards_per_latent_episode = memories_and_cumulative_rewards
 
-        # stack memories
+        # stack, then move once per field
 
-        memories = map(stack, zip(*memories_list))
+        memories = [t.to(self.device) for t in map(stack, zip(*memories_list))]
+        rewards_per_latent_episode = rewards_per_latent_episode.to(self.device)
 
         memories_list.clear()
 
@@ -1640,12 +1655,15 @@ class Agent(Module):
 
         valid_episode = episode_ids >= 0
 
-        dataset = TensorDataset(*[t[valid_episode] for t in (advantages, states, next_states, latent_gene_ids, actions, log_probs, values, dones)])
+        fields = tuple(t[valid_episode] for t in (advantages, states, next_states, latent_gene_ids, actions, log_probs, values, dones))
 
-        dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
+        if self.wrap_with_accelerate or self.use_dataloader:
+            dataloader = DataLoader(TensorDataset(*fields), batch_size = self.batch_size, shuffle = True)
 
-        if self.wrap_with_accelerate:
-            dataloader = self.accelerate.prepare(dataloader)
+            if self.wrap_with_accelerate:
+                dataloader = self.accelerate.prepare(dataloader)
+        else:
+            dataloader = ShuffledBatches(fields, self.batch_size)
 
         # updating actor and critic
 
@@ -2160,6 +2178,7 @@ class EPO(Module):
 
             next_obs, rewards, terminated, truncated = env.step_batch(actions.cpu().numpy(), worker_ids = active)[:4]
 
+            next_states = from_numpy(np.ascontiguousarray(next_obs)).float().to(self.device)
             rewards = from_numpy(np.asarray(rewards)).float().to(self.device)
             terminated = from_numpy(np.asarray(terminated)).to(self.device)
             truncated = from_numpy(np.asarray(truncated)).to(self.device)
@@ -2169,7 +2188,7 @@ class EPO(Module):
 
                 latent_id, episode_id, latent, state = slot.latent_id, slot.episode_id, slot.latent, slot.state
 
-                next_state = from_numpy(np.array(next_obs[k])).float().to(self.device)
+                next_state = next_states[k]
 
                 reward, terminated_at, truncated_at = rewards[k], terminated[k], truncated[k]
 

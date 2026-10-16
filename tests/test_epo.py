@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical, TransformedDistribution
 
-from evolutionary_policy_optimization.epo import EPO, Actor, Critic, LatentGenePool, create_agent, shrink_and_perturb_
+from evolutionary_policy_optimization.epo import EPO, Actor, Critic, LatentGenePool, ShuffledBatches, create_agent, shrink_and_perturb_
 from evolutionary_policy_optimization.mock_env import Env, VectorEnv
 
 
@@ -123,13 +123,13 @@ def test_e2e_with_mock_env(
     from evolutionary_policy_optimization import EPO, Env, create_agent
 
     agent = create_agent(
-        dim_state = 512,
+        dim_state = 32,
         num_latents = num_latents,
         dim_latent = 32,
         actor_num_actions = 5,
-        actor_dim = 256,
+        actor_dim = 32,
         actor_mlp_depth = 2,
-        critic_dim = 256,
+        critic_dim = 32,
         critic_mlp_depth = 4,
         use_critic_ema = use_critic_ema,
         diversity_aux_loss_weight = diversity_aux_loss_weight,
@@ -153,7 +153,7 @@ def test_e2e_with_mock_env(
         action_sample_temperature = 1.
     )
 
-    env = Env((512,))
+    env = Env((32,))
 
     epo(env, num_learning_cycles = 2)
 
@@ -501,6 +501,11 @@ def test_e2e_vectorized_env(action_is_continuous):
             seen.add(key)
             prev = key
 
+    # next_state of each step is the state the episode carries on from
+    for prev, curr in zip(real_memories, real_memories[1:]):
+        if (int(prev.latent_gene_id), int(prev.episode_id)) == (int(curr.latent_gene_id), int(curr.episode_id)):
+            assert torch.equal(prev.next_state, curr.state)
+
     # 2. full learning cycle
     epo(env, num_learning_cycles = 2)
     env.close()
@@ -563,3 +568,78 @@ def test_continuous_beta_details():
         wrap_with_accelerate = False,
     )
     assert agent_custom.actor.action_distr.pos_fn == 'softplus'
+
+
+@pytest.mark.parametrize('num_transitions, batch_size', ((32, 8), (30, 8), (1, 8), (8, 8)))
+def test_shuffled_batches(num_transitions, batch_size):
+    ids = torch.arange(num_transitions)
+    batches = ShuffledBatches((ids, -ids), batch_size)
+
+    for _ in range(2): # a fresh full pass on every iteration
+        gathered, batch_sizes = [], []
+
+        for batch_ids, batch_neg_ids in batches:
+            assert torch.equal(batch_ids, -batch_neg_ids) # fields stay row aligned
+            assert batch_ids.numel() <= batch_size
+
+            gathered.append(batch_ids)
+            batch_sizes.append(batch_ids.numel())
+
+        gathered = torch.cat(gathered)
+
+        assert gathered.sort().values.tolist() == ids.tolist() # every sample exactly once per pass
+        assert batch_sizes[-1] == (num_transitions - 1) % batch_size + 1 # only the last batch can be short
+
+
+@pytest.mark.parametrize('epochs', (1, 3))
+def test_learn_from_shuffles_each_epoch(monkeypatch, epochs):
+    import evolutionary_policy_optimization.epo as epo_module
+    from evolutionary_policy_optimization.epo import MemoriesAndCumulativeRewards, Memory
+
+    dim_state, num_actions, num_transitions, batch_size = 8, 4, 20, 8
+
+    agent = create_agent(
+        dim_state = dim_state,
+        num_latents = 1,
+        dim_latent = 4,
+        actor_num_actions = num_actions,
+        actor_dim = 8,
+        actor_mlp_depth = 2,
+        critic_dim = 8,
+        critic_mlp_depth = 2,
+        wrap_with_accelerate = False,
+        batch_size = batch_size,
+    )
+
+    states = torch.randn(num_transitions, dim_state)
+
+    with torch.no_grad():
+        actions, log_probs = agent.get_actor_actions(states, sample = True, use_unwrapped_model = True)
+
+    memories = [
+        Memory(
+            episode_id = torch.tensor(i % 2),
+            state = states[i],
+            next_state = torch.randn(dim_state),
+            latent_gene_id = torch.tensor(0),
+            action = actions[i],
+            log_prob = log_probs[i],
+            reward = torch.tensor(0.),
+            value = torch.tensor(0.),
+            done = torch.tensor(False)
+        )
+        for i in range(num_transitions)
+    ]
+
+    num_passes = []
+
+    class CountingShuffledBatches(epo_module.ShuffledBatches):
+        def __iter__(self):
+            num_passes.append(1)
+            yield from super().__iter__()
+
+    monkeypatch.setattr(epo_module, 'ShuffledBatches', CountingShuffledBatches)
+
+    agent.learn_from(MemoriesAndCumulativeRewards(memories, torch.zeros(1, 2)), epochs = epochs)
+
+    assert len(num_passes) == epochs # a fresh shuffled pass per epoch
