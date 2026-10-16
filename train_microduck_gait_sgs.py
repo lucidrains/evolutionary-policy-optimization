@@ -2,10 +2,9 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["fire", "mujoco", "mlx", "numpy", "torch", "tqdm", "einx", "imageio",
-#     "evolutionary-policy-optimization", "mujoco-warp", "env-ssl-wrapper>=0.5.13", "x-ppo==0.0.12", "nimporter-plus", "setuptools"]
+#     "evolutionary-policy-optimization", "mujoco_warp_lucidrains_fork[mlx,nim]==0.0.3", "env-ssl-wrapper>=0.5.13", "x-ppo==0.0.12", "nimporter-plus", "setuptools"]
 # [tool.uv.sources]
 # evolutionary-policy-optimization = { path = ".", editable = true }
-# mujoco-warp = { git = "https://github.com/lucidrains/mujoco_warp" }
 # ///
 """Single microduck gait, sparse gait rewards, SGS-chosen initial states.
 
@@ -14,12 +13,12 @@ sampler concentrates training on the frontier cells. With --distill, a no-CPG
 student learns from the CPG teacher's labels on its own visited states (online
 DAgger via x-ppo 0.0.12), optionally with representation alignment.
 
-Dependencies come from PyPI / GitHub - uv resolves and clones them, including
-the fast MLX training stack from lucidrains' mujoco_warp fork
-(https://github.com/lucidrains/mujoco_warp); the robot model repo
-(pollen-robotics/microduck_rl) is git cloned next to this repo on first run if
-not already there. The CPG gait pattern it distills from (the leg-pattern
-table, and the clock it rides) lives in this file. On a Mac the run ends by rendering the gait it found into
+Dependencies come from PyPI - uv resolves them, including the fast MLX
+training stack from lucidrains' mujoco_warp fork, published as
+mujoco_warp_lucidrains_fork; the robot model repo (pollen-robotics/microduck_rl)
+is git cloned next to this repo on first run if not already there. The CPG gait
+pattern it distills from (the leg-pattern table, and the clock it rides) lives
+in this file. On a Mac the run ends by rendering the gait it found into
 <run>/videos/{teacher,student}.mp4.
 
   uv run train_microduck_gait_sgs.py --total_env_steps 2000000
@@ -28,12 +27,10 @@ table, and the clock it rides) lives in this file. On a Mac the run ends by rend
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import math
 import os
 import subprocess
-import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -54,36 +51,24 @@ from evolutionary_policy_optimization import (
 )
 
 from env_ssl_wrapper import SGSSampler, SuccessGuidedSamplingWrapper, fourier_time
+from mujoco_warp.mps.robot import BatchedEngine
 
 
-# prerequisites: the sim fork is imported below the check, so a missing
-# checkout can be cloned before the import happens
+# prerequisites: the robot model repo is required for the MJCF; clone it next
+# to this repo if not already there
 
 def ensure_deps():
-    # prerequisites are cloned next to this repo if not detected: the robot
-    # model repo (required for the MJCF) and, only when uv has not fetched it,
-    # the MLX sim fork
-
     root = Path(__file__).resolve().parent.parent
+    path = root / 'microduck_rl'
 
-    for name, url in (
-        ('microduck_rl', 'https://github.com/pollen-robotics/microduck_rl'),
-        ('mujoco_warp', 'https://github.com/lucidrains/mujoco_warp'),
-    ):
-        path = root / name
+    if path.exists():
+        return
 
-        if path.exists() or (name == 'mujoco_warp' and importlib.util.find_spec('mujoco_warp') is not None):
-            continue
-
-        print(f'[deps] cloning {url} -> {path}')
-        subprocess.run(['git', 'clone', '--depth', '1', url, str(path)], check = True)
-
-        if name == 'mujoco_warp':
-            sys.path.insert(0, str(path))
+    url = 'https://github.com/pollen-robotics/microduck_rl'
+    print(f'[deps] cloning {url} -> {path}')
+    subprocess.run(['git', 'clone', '--depth', '1', url, str(path)], check = True)
 
 ensure_deps()
-
-from mujoco_warp.mps.robot import BatchedEngine  # noqa: E402
 
 # constants
 
