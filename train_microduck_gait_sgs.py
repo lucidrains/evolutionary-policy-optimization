@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["fire", "mujoco", "mlx", "numpy", "torch", "tqdm", "einx", "imageio",
-#     "evolutionary-policy-optimization", "mujoco_warp_lucidrains_fork[mlx,nim]==0.0.3", "env-ssl-wrapper>=0.5.13", "x-ppo==0.0.12", "nimporter-plus", "setuptools"]
+#     "evolutionary-policy-optimization", "mujoco_warp_lucidrains_fork[mlx,nim]==0.0.5", "env-ssl-wrapper>=0.5.13", "x-ppo==0.0.12", "nimporter-plus", "setuptools"]
 # [tool.uv.sources]
 # evolutionary-policy-optimization = { path = ".", editable = true }
 # ///
@@ -85,7 +85,6 @@ ACTION_INTERFACE_RANGE = (-ACTION_MARGIN, ACTION_MARGIN)
 OBS_CPG_DIM = 2
 
 CPG_FREQ = 2.0
-CPG_SWING_MAX = 0.22
 CPG_KNEE_SCALE = 1.6
 CPG_ANKLE_SCALE = 0.55
 CPG_ROLL_AMP = 0.035
@@ -125,10 +124,6 @@ SELF_COLLISION_WEIGHT = -1.0
 FOOT_HEIGHT_WEIGHT = 3.0
 FOOT_HEIGHT_CLEAR = 0.01
 FOOT_HEIGHT_CAP = 0.02
-
-ZMP_WEIGHT = 2.0
-ZMP_STD = 0.05
-ZMP_EMA = 0.7
 
 POSE_STDS = np.array([
     0.30, 0.05, 0.40, 0.40, 0.25,
@@ -278,14 +273,6 @@ def _quat_to_mat(q: np.ndarray) -> np.ndarray:
     np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], -1),
   ], -2)
 
-def _quat_mul(u: np.ndarray, v: np.ndarray) -> np.ndarray:
-  return np.stack([
-    u[..., 0] * v[..., 0] - u[..., 1] * v[..., 1] - u[..., 2] * v[..., 2] - u[..., 3] * v[..., 3],
-    u[..., 0] * v[..., 1] + u[..., 1] * v[..., 0] + u[..., 2] * v[..., 3] - u[..., 3] * v[..., 2],
-    u[..., 0] * v[..., 2] - u[..., 1] * v[..., 3] + u[..., 2] * v[..., 0] + u[..., 3] * v[..., 1],
-    u[..., 0] * v[..., 3] + u[..., 1] * v[..., 2] - u[..., 2] * v[..., 1] + u[..., 3] * v[..., 0],
-  ], -1)
-
 def _matmul33(m: np.ndarray, v: np.ndarray) -> np.ndarray:
   """(..., 3, 3) @ (..., 3)."""
   return np.einsum("...ij,...j->...i", m, v)
@@ -304,24 +291,107 @@ def _quat_mul_np(u: np.ndarray, v: np.ndarray) -> np.ndarray:
     w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
   ], -1)
 
-def _terrain_frame(slope_deg, direction_deg = 0.0):
-  """Ramp frame: R = Rz(psi) Ry(-theta). Returns (up, uphill, quat).
+class MicroduckMlxEngine(BatchedEngine):
+  """MLX engine plus the row/state helpers the env uses."""
 
-  `up` = plane normal (third column of R), `uphill` = in-plane steepest-ascent
-  unit vector (first column of R), `quat` = R as a (w, x, y, z) quaternion, so
-  a body spawned with it stands on the ramp facing uphill.
-  """
-  th = np.deg2rad(np.asarray(slope_deg, np.float64))
-  ps = np.deg2rad(np.asarray(direction_deg, np.float64))
-  ct, st, cp, sp = np.cos(th), np.sin(th), np.cos(ps), np.sin(ps)
+  backend = 'mlx'
 
-  up = np.stack([-st * cp, -st * sp, ct * np.ones_like(cp)], -1)
-  uphill = np.stack([ct * cp, ct * sp, st * np.ones_like(cp)], -1)
+  def set_ctrl(self, ctrl):
+    self.ctrl = mx.array(np.asarray(ctrl, np.float32))
 
-  # q = qz(psi) [*] qy(-theta)  (w, x, y, z), MuJoCo convention
-  qz = np.stack([np.cos(ps / 2), np.zeros_like(ps), np.zeros_like(ps), np.sin(ps / 2)], -1)
-  qy = np.stack([np.cos(th / 2), np.zeros_like(th), -np.sin(th / 2), np.zeros_like(th)], -1)
-  return up, uphill, _quat_mul_np(qz, qy)
+  def sync(self):
+    mx.eval(self.qpos, self.qvel, self.xmat, self.xpos, self.cvel, self.xipos, self.cinert, self.geom_xpos, self.subtree_com)
+
+  def set_rows(self, rows, qpos, qvel):
+    for i, q, v in zip(np.asarray(rows, np.int64).reshape(-1), np.asarray(qpos, np.float32), np.asarray(qvel, np.float32)):
+      self.qpos = self.qpos.at[i].subtract(self.qpos[i]).at[i].add(mx.array(q))
+      self.qvel = self.qvel.at[i].subtract(self.qvel[i]).at[i].add(mx.array(v))
+      self.warm = self.warm.at[i].subtract(self.warm[i])
+
+  def snapshot_rows(self, rows):
+    mx.eval(self.qpos, self.qvel)
+    return np.asarray(self.qpos)[rows].copy(), np.asarray(self.qvel)[rows].copy()
+
+  def restore_rows(self, rows, qpos, qvel):
+    q, v = np.array(self.qpos), np.array(self.qvel)
+    q[rows], v[rows] = qpos, qvel
+    self.qpos, self.qvel = mx.array(q), mx.array(v)
+
+  def foot_contacts(self, geoms):
+    if not hasattr(self, 'pair_conct'):
+      return np.zeros((self.nworld, len(geoms)), bool)
+
+    pc, g1, g2 = np.asarray(self.pair_conct), self.rig.pair_g1, self.rig.pair_g2
+    return np.stack([(pc[:, (g1 == g) | (g2 == g)] > 0).any(axis = 1) for g in geoms], axis = 1)
+
+
+class MicroduckCpuEngine:
+  """`mujoco_warp` CPU engine with the Nim fast paths, same row/state surface."""
+
+  backend = 'cpu'
+
+  def __init__(self, model, nworld):
+    import mujoco_warp
+    from mujoco_warp._src import nim_cpu
+
+    self.mjw, self.m = mujoco_warp, mujoco_warp.put_model(model)
+    self.d = mujoco_warp.make_data(model, nworld = nworld)
+    self.nworld, self.nim_available = nworld, nim_cpu.get_ops() is not None
+
+  qpos = property(lambda self: self.d.qpos.numpy())
+  qvel = property(lambda self: self.d.qvel.numpy())
+  xmat = property(lambda self: self.d.xmat.numpy())
+  xpos = property(lambda self: self.d.xpos.numpy())
+  cvel = property(lambda self: self.d.cvel.numpy())
+  xipos = property(lambda self: self.d.xipos.numpy())
+  cinert = property(lambda self: self.d.cinert.numpy())
+  subtree_com = property(lambda self: self.d.subtree_com.numpy())
+  geom_xpos = property(lambda self: self.d.geom_xpos.numpy())
+
+  def set_ctrl(self, ctrl):
+    self.d.ctrl.numpy()[:] = np.asarray(ctrl, np.float32)
+
+  def step(self, kin = False):
+    self.mjw.step(self.m, self.d)
+
+  def sync(self):
+    pass
+
+  def set_rows(self, rows, qpos, qvel):
+    self.d.qpos.numpy()[rows] = np.asarray(qpos, np.float32)
+    self.d.qvel.numpy()[rows] = np.asarray(qvel, np.float32)
+    self.d.qacc_warmstart.numpy()[rows] = 0.0
+
+  def snapshot_rows(self, rows):
+    return self.qpos[rows].copy(), self.qvel[rows].copy()
+
+  def restore_rows(self, rows, qpos, qvel):
+    self.d.qpos.numpy()[rows] = np.asarray(qpos, np.float32)
+    self.d.qvel.numpy()[rows] = np.asarray(qvel, np.float32)
+
+  def foot_contacts(self, geoms):
+    nacon = min(int(self.d.nacon.numpy()[0]), self.d.contact.geom.shape[0])
+    geom, world = self.d.contact.geom.numpy()[:nacon], self.d.contact.worldid.numpy()[:nacon]
+    out = np.zeros((self.nworld, len(geoms)), bool)
+
+    for j, g in enumerate(geoms):
+      out[world[(geom == g).any(axis = 1)], j] = True
+
+    return out
+
+  def set_world_tables(self, *args, **kwargs):
+    raise NotImplementedError('CPU backend is flat-floor only')
+
+
+def make_engine(model, nworld, backend = 'mlx', coop = True):
+  if backend == 'mlx':
+    return MicroduckMlxEngine(model, nworld = nworld, coop = coop)
+
+  if backend == 'cpu':
+    return MicroduckCpuEngine(model, nworld)
+
+  raise ValueError(f"backend must be 'mlx' or 'cpu', got {backend!r}")
+
 
 class MicroduckMlxBatchedEnv:
   def __init__(
@@ -338,6 +408,7 @@ class MicroduckMlxBatchedEnv:
     fixed_command: tuple | None = None,
     rescale_to=ACTION_INTERFACE_RANGE,
     coop: bool = True,
+    backend: str = 'mlx',
   ):
     import mujoco
 
@@ -347,7 +418,8 @@ class MicroduckMlxBatchedEnv:
     self.model.actuator_biasprm[:, 1] = -self.model.actuator_gainprm[:, 0]
     self.model.actuator_biasprm[:, 2] = -kv
 
-    self.eng = BatchedEngine(self.model, nworld=num_envs, coop=coop)
+    self.eng = make_engine(self.model, num_envs, backend = backend, coop = coop)
+    self.backend = backend
     self.num_envs = num_envs
     self.nv = self.model.nv
     self.action_dim = self.model.nu
@@ -396,12 +468,6 @@ class MicroduckMlxBatchedEnv:
       l_ankle = self.l_ankle, r_ankle = self.r_ankle, l_hip_roll = self.l_hip_roll, r_hip_roll = self.r_hip_roll,
     )
 
-    g1, g2 = self.eng.rig.pair_g1, self.eng.rig.pair_g2
-    self._foot_pair_idx = [
-      np.array([p for p in range(len(g1)) if g in (int(g1[p]), int(g2[p]))], np.int64) for g in self._foot_geoms
-    ]
-    self._foot_pair_indices = self._foot_pair_idx
-
     self._last_action = np.zeros((num_envs, self.action_dim), np.float64)
     self._ctrl_np = np.zeros((num_envs, self.action_dim), np.float32)
     self._command = np.zeros((num_envs, COMMAND_DIM), np.float64)
@@ -411,19 +477,6 @@ class MicroduckMlxBatchedEnv:
     self._phi = np.zeros(num_envs, np.float64)
     self._rngs = [np.random.default_rng(seed + i) for i in range(num_envs)]
 
-    # per-world ground plane (ramps): the floor geom is geom 0 of the scene;
-    # `up` is its normal, `uphill` the in-plane ascent direction, `spawn_quat`
-    # rotates the STAND keyframe onto the plane. Defaults are the flat floor.
-    # NOTE: the floor geom must stay geom 0 for the packed-table write below.
-
-    self.floor_geom = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
-    assert self.floor_geom == 0, "floor geom must be geom 0 for per-world plane tables"
-
-    self._up = np.tile(np.array([0.0, 0.0, 1.0]), (num_envs, 1))
-    self._uphill = np.tile(np.array([1.0, 0.0, 0.0]), (num_envs, 1))
-    self._spawn_quat = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (num_envs, 1))
-    self._slope_deg = np.zeros(num_envs)
-    self._pos0 = np.zeros((num_envs, 3))
     self._reset_scale = np.ones(num_envs)
     self._reset_split = np.zeros(num_envs)
     self._reset_phase = np.zeros(num_envs)
@@ -432,49 +485,9 @@ class MicroduckMlxBatchedEnv:
     self._reset_cmd = np.full((num_envs, COMMAND_DIM), np.nan)
     self._phase_reset_gain = 0.0
     self._phase_prev_contact = np.zeros((num_envs, NUM_FEET), bool)
-    self._reset_cache_qpos = np.zeros((num_envs, self.model.nq))
-    self._reset_cache_qvel = np.zeros((num_envs, self.nv))
-    self._reset_cache_valid = np.zeros(num_envs, bool)
-    self._reset_cache_action = np.zeros((num_envs, self.action_dim))
-    self._reset_cache_has_action = np.zeros(num_envs, bool)
 
     for i in range(num_envs):
       self.reset_one(i, seed=seed + i)
-
-  @property
-  def progress(self):
-    """Per-world in-plane progress (m) along the uphill direction since the reset."""
-    qpos = np.asarray(self.eng.qpos)
-    return ((qpos[:, : SPATIAL_DIM] - self._pos0) * self._uphill).sum(-1)
-
-  # ---------------------------------------------------------------- terrain
-  def set_terrain(self, rows, slope_deg, direction_deg = 0.0):
-    """Set the per-world ground plane: a ramp of `slope_deg` whose in-plane
-    steepest-ascent direction is `direction_deg` (yaw about world z).
-
-    The plane passes through the origin; the duck spawned by `reset_one` stands
-    on it facing uphill. The new plane reaches the physics on the next step
-    (per-world plane tables are uploaded lazily).
-    """
-    idx = np.asarray(rows, np.int64).reshape(-1)
-    up, uphill, quat = _terrain_frame(np.asarray(slope_deg, np.float64), np.asarray(direction_deg, np.float64))
-
-    up = np.broadcast_to(up, (len(idx), 3)) if up.ndim == 1 else up
-    uphill = np.broadcast_to(uphill, (len(idx), 3)) if uphill.ndim == 1 else uphill
-    quat = np.broadcast_to(quat, (len(idx), 4)) if quat.ndim == 1 else quat
-
-    self._up[idx] = np.asarray(up, np.float64)
-    self._uphill[idx] = np.asarray(uphill, np.float64)
-    self._spawn_quat[idx] = np.asarray(quat, np.float64)
-    self._slope_deg[idx] = np.asarray(slope_deg, np.float64) if np.ndim(slope_deg) else float(slope_deg)
-
-    # plane normal + point live in the floor geom's rows of the packed tables
-
-    self.eng.set_world_tables(
-      idx,
-      geom_quat = np.asarray(quat, np.float64).reshape(len(idx), 4),
-      geom_pos = np.zeros((len(idx), 3)),
-    )
 
   def set_reset_scale(self, rows, scale):
     """Set the per-world reset perturbation scale (0 = exact home pose at rest)."""
@@ -488,26 +501,6 @@ class MicroduckMlxBatchedEnv:
     idx = np.asarray(rows, np.int64).reshape(-1)
     self._reset_split[idx] = np.asarray(split, np.float64)
     self._reset_phase[idx] = np.asarray(phase, np.float64)
-
-  def set_reset_state(self, rows, qpos, qvel = None, last_action = None):
-    """Set a cached reset state (qpos, qvel) to be written on the next reset_one."""
-    idx = np.asarray(rows, np.int64).reshape(-1)
-    qpos = np.asarray(qpos, np.float64).reshape(len(idx), -1)
-    self._reset_cache_qpos[idx] = qpos
-
-    if qvel is None:
-        self._reset_cache_qvel[idx] = 0.0
-    else:
-        self._reset_cache_qvel[idx] = np.asarray(qvel, np.float64).reshape(len(idx), -1)
-
-    if last_action is not None:
-        self._reset_cache_action[idx] = np.asarray(last_action, np.float64).reshape(len(idx), -1)
-        self._reset_cache_has_action[idx] = True
-    else:
-        self._reset_cache_action[idx] = 0.0
-        self._reset_cache_has_action[idx] = False
-
-    self._reset_cache_valid[idx] = True
 
   def set_reset_tilt(self, rows, pitch = 0.0, roll = 0.0):
     """Tilt the spawned trunk by (pitch, roll) rad in addition to the terrain frame."""
@@ -547,14 +540,10 @@ class MicroduckMlxBatchedEnv:
     """
     gain = self._phase_reset_gain
 
-    if gain <= 0.0 or not hasattr(self.eng, 'pair_conct'):
+    if gain <= 0.0:
       return phi
 
-    pair_conct = np.asarray(self.eng.pair_conct)[active]
-    contact = np.stack([
-      (pair_conct[:, ids].sum(axis = 1) > 0) if len(ids) else np.zeros(len(active), bool)
-      for ids in self._foot_pair_indices
-    ], axis = 1)
+    contact = self.foot_contacts[active]
     prev = self._phase_prev_contact[active]
     phi, contact = self.cpg_gen.phase_reset(phi, contact, prev, gain = gain)
     self._phase_prev_contact[active] = contact
@@ -563,17 +552,11 @@ class MicroduckMlxBatchedEnv:
   @property
   def foot_contacts(self):
     """(num_envs, NUM_FEET) bool: which feet are touching the ground right now."""
-    pair_conct = np.asarray(self.eng.pair_conct)
-    return np.stack([
-      (pair_conct[:, ids].sum(axis = 1) > 0) if len(ids) else np.zeros(pair_conct.shape[0], bool)
-      for ids in self._foot_pair_indices
-    ], axis = 1)
+    return self.eng.foot_contacts(self._foot_geoms)
 
   # ------------------------------------------------------------------ helpers
   def _write_state(self, i: int, qpos: np.ndarray, qvel: np.ndarray):
-    self.eng.qpos = self.eng.qpos.at[i].subtract(self.eng.qpos[i]).at[i].add(mx.array(qpos.astype(np.float32)))
-    self.eng.qvel = self.eng.qvel.at[i].subtract(self.eng.qvel[i]).at[i].add(mx.array(qvel.astype(np.float32)))
-    self.eng.warm = self.eng.warm.at[i].subtract(self.eng.warm[i])
+    self.eng.set_rows([i], qpos[None], qvel[None])
 
   def _object_velocity(self, cvel, xipos, subtree_com, body: int, local: bool):
     """Batched mj_objectVelocity."""
@@ -621,11 +604,6 @@ class MicroduckMlxBatchedEnv:
     if seed is not None:
       self._rngs[i] = rng
 
-    up = self._up[i]
-
-    # spawn on the current ground plane: anchor along the plane normal above
-    # the origin (the plane passes through it), trunk rotated onto the plane
-
     qpos = self.home_qpos.copy()
 
     # per-worker reset perturbation scale: 0 = exact home pose at rest (the
@@ -633,9 +611,8 @@ class MicroduckMlxBatchedEnv:
     # these scales (initial-state distribution curriculum).
 
     s = self._reset_scale[i]
-    anchor = up * (self.home_qpos[SPATIAL_DIM - 1] + s * rng.uniform(*RESET_Z_RANGE))
-    qpos[: SPATIAL_DIM] = anchor
-    spawn_quat = self._spawn_quat[i]
+    qpos[: SPATIAL_DIM] = WORLD_UP * (self.home_qpos[SPATIAL_DIM - 1] + s * rng.uniform(*RESET_Z_RANGE))
+    spawn_quat = np.array([1.0, 0.0, 0.0, 0.0])
     pitch, roll = self._reset_tilt[i]
 
     if pitch != 0.0 or roll != 0.0:
@@ -679,23 +656,18 @@ class MicroduckMlxBatchedEnv:
     if np.isfinite(self._reset_cmd[i]).all():
       command = self._reset_cmd[i].copy()
 
-    if self._reset_cache_valid[i]:
-        qpos = self._reset_cache_qpos[i].copy()
-        qvel = self._reset_cache_qvel[i].copy()
-
     # mid-stride momentum prime: forward trunk velocity on top of the spawned
     # state (world-x is the free joint's first velocity dof)
 
     qvel[0] += self._reset_vel[i]
 
     self._write_state(i, qpos, qvel)
-    self._last_action[i] = self._reset_cache_action[i] if self._reset_cache_has_action[i] else 0.0
+    self._last_action[i] = 0.0
     self._command[i] = command
     self._steps[i] = 0
     self._foot_air[i] = 0.0
     self._episodes[i] += 1
     self._phi[i] = self._reset_phase[i]
-    self._pos0[i] = qpos[: SPATIAL_DIM]
 
     xquat = qpos[QUAT_OFFSET:QUAT_OFFSET + SPATIAL_DIM + 1]
     xquat = xquat / np.linalg.norm(xquat)
@@ -731,12 +703,7 @@ class MicroduckMlxBatchedEnv:
     # slots do not decay under a stale ctrl (they come back mid-episode intact)
 
     idle = np.setdiff1d(np.arange(self.num_envs, dtype = np.int64), active) if k < self.num_envs else np.empty(0, np.int64)
-    keep = None
-    if len(idle):
-      keep = np.zeros(self.num_envs, bool)
-      keep[idle] = True
-      qpos_keep = np.asarray(self.eng.qpos).astype(np.float32)
-      qvel_keep = np.asarray(self.eng.qvel).astype(np.float32)
+    keep = self.eng.snapshot_rows(idle) if len(idle) else None
 
     a = np.asarray(actions, np.float32).reshape(k, self.action_dim)
     if self.rescale_to is not None:
@@ -757,18 +724,15 @@ class MicroduckMlxBatchedEnv:
       phi = self.cpg_gen.advance(phi).numpy()
 
     self._ctrl_np[active] = ctrl.astype(np.float32)
-    self.eng.ctrl = mx.array(self._ctrl_np)
+    self.eng.set_ctrl(self._ctrl_np)
+
     for s in range(N_SUBSTEPS):
-      self.eng.step(kin=(s == N_SUBSTEPS - 1))
-    mx.eval(
-      self.eng.qpos, self.eng.qvel, self.eng.xmat, self.eng.xpos, self.eng.cvel, self.eng.xipos,
-      self.eng.cinert, self.eng.geom_xpos, self.eng.subtree_com, self.eng.pair_conct,
-    )
+      self.eng.step(kin = (s == N_SUBSTEPS - 1))
+
+    self.eng.sync()
 
     if keep is not None:
-      mask = mx.array(keep)[:, None]
-      self.eng.qpos = mx.where(mask, mx.array(qpos_keep), self.eng.qpos)
-      self.eng.qvel = mx.where(mask, mx.array(qvel_keep), self.eng.qvel)
+      self.eng.restore_rows(idle, *keep)
 
     qpos = np.asarray(self.eng.qpos)[active].astype(np.float64)
     qvel = np.asarray(self.eng.qvel)[active].astype(np.float64)
@@ -779,7 +743,6 @@ class MicroduckMlxBatchedEnv:
     cinert = np.asarray(self.eng.cinert)[active].astype(np.float64)
     subtree_com = np.asarray(self.eng.subtree_com)[active].astype(np.float64)
     geom_xpos = np.asarray(self.eng.geom_xpos)[active].astype(np.float64)
-    pair_conct = np.asarray(self.eng.pair_conct)[active]
 
     self._steps[active] = steps + 1
     self._last_action[active] = a
@@ -794,10 +757,7 @@ class MicroduckMlxBatchedEnv:
     vx = np.cos(yaw) * lin_world[:, 0] + np.sin(yaw) * lin_world[:, 1]
     wz = ang_local[:, 2]
 
-    # terrain-relative geometry: heights and uprightness are measured against
-    # the per-world ground plane (up == world z on the flat floor)
-
-    up = self._up[active]
+    up = np.broadcast_to(WORLD_UP, (k, 3))
     trunk_up = self._xmat_trunk[:, :, SPATIAL_DIM - 1]
     uprightness = (trunk_up * up).sum(-1)
     trunk_h = (xpos[:, TRUNK_BODY] * up).sum(-1)
@@ -832,9 +792,7 @@ class MicroduckMlxBatchedEnv:
     moving_any = (np.abs(command[:, 0]) > COMMAND_EPS) | (np.abs(command[:, 1]) > COMMAND_EPS)
     gait_active = is_standing_gait & moving_any
 
-    foot_contact = np.stack([
-      (pair_conct[:, idx].sum(axis=1) > 0) if len(idx) else np.zeros(k, bool) for idx in self._foot_pair_idx
-    ], axis=1)
+    foot_contact = self.eng.foot_contacts(self._foot_geoms)[active]
     air = np.where(gait_active[:, None], np.where(foot_contact, 0.0, self._foot_air[active] + 1.0), 0.0)
     self._foot_air[active] = air
     air_time = air * (PHYSICS_DT * N_SUBSTEPS)
@@ -895,99 +853,8 @@ class MicroduckMlxBatchedEnv:
 # gait banks
 
 DEFAULT_BANK = ('tier', 'target')
-SPLITS = (-0.3, -0.15, 0.0, 0.15, 0.3)
-PHASES = (0.0, 1.5708, 3.1416, 4.7124)
-TILTS = (0.0, 0.05, -0.05)
-SCALES = (0.0, 0.5, 1.0)
-TARGETS = (0.05, 0.15, 0.3, 0.5, 0.8)
+TARGETS = (0.0, 0.05, 0.15, 0.3, 0.5, 0.8)
 
-def make_bank(
-    splits = SPLITS,
-    phases = PHASES,
-    tilts = TILTS,
-    scales = SCALES,
-    targets = TARGETS,
-    tiers: int = 6,
-):
-    """The SGS bank: difficulty tier x target distance, one cell per combination.
-
-    The state grid (foot split x clock phase x trunk tilt x reset-noise scale)
-    is ranked by a difficulty proxy and cut into `tiers` chunks, so a cell is
-    "a start this hard, this far to walk": SGS rides the tier x target frontier
-    while each cell keeps drawing diverse states from its own chunk. Coarse
-    cells give per-cell success rates that stabilise within a cycle, which is
-    what an initial-state curriculum needs to climb.
-    """
-
-    grid = [(sp, ph, ti, sc) for sp in splits for ph in phases for ti in tilts for sc in scales]
-    span_split = max(abs(v) for v in splits) or 1.0
-    span_tilt = max(abs(v) for v in tilts) or 1.0
-
-    # difficulty proxy: a noiseless home-pose start (scale 0) is easiest, then
-    # reset noise, then a mid-step split, then a tilted trunk - so tier 0 is
-    # "stand still at rest" and the last tier is "spawn mid-fall"
-
-    diff = np.array([
-        abs(sp) / span_split + 0.5 * abs(ti) / span_tilt + 0.5 * float(sc)
-        for sp, _, ti, sc in grid
-    ])
-    tier_of = np.empty(len(grid), np.int64)
-
-    for t, chunk in enumerate(np.array_split(np.argsort(diff), min(tiers, len(grid)))):
-        tier_of[chunk] = t
-
-    bank = []
-
-    for t in range(tier_of.max() + 1):
-        pool = [grid[k] for k in np.flatnonzero(tier_of == t)]
-
-        for tg in targets:
-            def draw(rng, idx, step, pool = pool, target = float(tg)):
-                sp, ph, ti, sc = pool[int(rng.integers(len(pool)))]
-                return dict(split = sp, phase = ph, tilt = ti, scale = sc, target = target)
-
-            bank.append(draw)
-
-    return bank
-def make_walk_bank(
-    vxs = (0.0, 0.1, 0.2),
-    phases = PHASES,
-    split_amp: float = 0.15,
-    targets = TARGETS,
-):
-    """The walking-pathway bank (OmniReset-style reset coverage of the gait).
-
-    Each cell is a mid-stride start - forward trunk velocity x clock phase x hip
-    split amplitude - crossed with a target distance. The grid puts the bank's
-    mass on the *pathway* of the behavior itself (mid-step poses, weight
-    transfer, forward momentum), which is where RSI (DeepMimic) and OmniReset
-    put the initial-state distribution: from a momentum start the duck cannot
-    freeze back to a stand, so the reachable first move is a catch step, and
-    SGS then rides the frontier of (momentum x distance) as steps stabilise.
-    Per-draw jitter turns each cell into a region, keeping per-cell success
-    rates stable enough for the curriculum to climb.
-    """
-
-    bank = []
-
-    for vx in vxs:
-        for ph in phases:
-            sp = split_amp * np.sin(float(ph))
-
-            for tg in targets:
-                def draw(rng, idx, step, vx = float(vx), ph = float(ph), sp = float(sp), tg = float(tg)):
-                    return dict(
-                        vx = vx + rng.uniform(-0.02, 0.02),
-                        split = sp + rng.uniform(-0.03, 0.03),
-                        phase = ph + rng.uniform(-0.3, 0.3),
-                        tilt = 0.0,
-                        scale = 0.5,
-                        target = tg,
-                    )
-
-                bank.append(draw)
-
-    return bank
 def make_stand_bank(
     scales = (0.0, 0.5, 1.0),
     targets = TARGETS,
@@ -1042,28 +909,6 @@ def _pairs(v):
         out.append((float(bits[0]), float(bits[1]) if len(bits) > 1 else 0.0))
 
     return tuple(out)
-def make_gait_bank(kind: str, targets = '0.05,0.15,0.3,0.5,0.8', stand_scales = '0.0,0.5,1.0', stand_commands = '',
-                   primed_splits = '0.0,0.15,0.3', bank_tiers: int = 6, walk_vxs = '0.0,0.05,0.10',
-                   walk_phases = '0,1.5708,3.1416,4.7124', walk_split_amp: float = 0.15):
-    """The bank for a training run, by kind: 'stand' (reset-noise scale x
-    commanded goal x target ladder), 'walk' (mid-stride starts x targets),
-    'primed' (mid-step primes), or the difficulty-tiered default grid."""
-
-    if kind == 'walk':
-        return make_walk_bank(vxs = _floats(walk_vxs), phases = _floats(walk_phases),
-                              split_amp = walk_split_amp, targets = _floats(targets))
-
-    if kind == 'stand':
-        return make_stand_bank(scales = _floats(stand_scales), targets = _floats(targets),
-                               commands = _pairs(stand_commands) or None)
-
-    if kind == 'primed':
-        splits = _floats(primed_splits)
-        return make_bank(splits = splits, phases = (0.0,), tilts = (0.0,), scales = (1.0,),
-                         targets = _floats(targets)[:1], tiers = len(splits))
-
-    return make_bank(targets = _floats(targets), tiers = bank_tiers)
-
 @torch.no_grad()
 def evaluate(env: DuckGaitVecEnv, agent, num_episodes = 128, horizon = 400, latent_id = 0, reach = 0.35):
     """Greedy eval from the clean stand: distance, lines, foot steps, falls.
@@ -1080,7 +925,7 @@ def evaluate(env: DuckGaitVecEnv, agent, num_episodes = 128, horizon = 400, late
     alive = np.ones(n, bool)
     x_max, x_end, lines = np.zeros(n), np.zeros(n), np.zeros(n, np.int64)
     speed_sum, n_steps, surv_steps, fell = np.zeros(n), np.zeros(n), np.zeros(n), np.zeros(n, bool)
-    prev_contact = np.zeros((n, len(env.env._foot_pair_indices)), bool)
+    prev_contact = np.zeros((n, NUM_FEET), bool)
     strike_errs = []
     prev_x = np.asarray(env.env.eng.qpos)[rows, 0].astype(np.float64)
 
@@ -1186,6 +1031,7 @@ class DuckGaitVecEnv:
         shaping: float = 1.0,
         bank = None,
         sgs: dict | None = None,
+        backend: str = 'mlx',
     ):
         self.num_envs = int(num_envs)
 
@@ -1195,7 +1041,7 @@ class DuckGaitVecEnv:
             target_bonus = target_bonus, fall_penalty = fall_penalty, min_steps_success = min_steps_success,
             min_sustain_steps = min_sustain_steps, stance_soft = stance_soft, forward_pull = forward_pull,
             time_features = time_features, cpg = cpg, forced_swing = forced_swing, phase_reset = phase_reset,
-            shaping = shaping, bank = bank, sgs = sgs,
+            shaping = shaping, bank = bank, sgs = sgs, backend = backend,
         )
         self.horizon = int(horizon)
         self.line_step = float(line_step)
@@ -1246,7 +1092,9 @@ class DuckGaitVecEnv:
             cpg = cpg,
             forced_swing = forced_swing,
             fixed_command = (command, 0.0),
+            backend = backend,
         )
+        self.backend = backend
         self.env._phase_reset_gain = float(phase_reset)
         self.command = self.env._command.copy()
         self.home_ctrl = self.env.home_ctrl.copy()
@@ -1278,7 +1126,7 @@ class DuckGaitVecEnv:
         self._reached = np.zeros(self.num_envs, bool)
         self._cross_at = np.full(self.num_envs, -1, np.int64)
         self._bonus_paid = np.zeros(self.num_envs, bool)
-        self._prev_contact = np.zeros((self.num_envs, len(self.env._foot_pair_indices)), bool)
+        self._prev_contact = np.zeros((self.num_envs, NUM_FEET), bool)
         self._prev_x = np.zeros(self.num_envs)
         self._phase = np.zeros(self.num_envs)
         self._t = np.zeros(self.num_envs)
@@ -1300,7 +1148,7 @@ class DuckGaitVecEnv:
 
         self.sgs = SuccessGuidedSamplingWrapper(
             self,
-            reset_configs = bank if bank is not None else make_bank(),
+            reset_configs = bank if bank is not None else make_stand_bank(),
             success_fn = self._success,
             **kwargs,
         )
@@ -1718,6 +1566,7 @@ def render_gait(
     cpg: bool = True,
     forced_swing: float = 0.25,
     time_features: str = 'fourier',
+    backend: str = 'mlx',
 ):
     split_s, _, phase_s = str(start).partition('@')
     split, phase = float(split_s), float(phase_s or 0.0)
@@ -1725,7 +1574,7 @@ def render_gait(
     band = (band[0], band[1]) if len(band) >= 2 else (0.3, 3.0)
 
     env = DuckGaitVecEnv(num_envs = 1, horizon = horizon, seed = seed, learned_clock = learned_clock, clock_band = band,
-                         cpg = cpg, forced_swing = forced_swing, time_features = time_features)
+                         cpg = cpg, forced_swing = forced_swing, time_features = time_features, backend = backend)
     env._apply_state([0], dict(split = split, phase = phase, tilt = tilt, scale = scale, target = 0.0))
 
     agent, obs_dim = load_agent(checkpoint, num_latents = num_latents)
@@ -1812,20 +1661,18 @@ def main(
     # task
     horizon: int = 400, command_speed: float = 0.15, line_step: float = 0.05,
     line_bonus: float = 0.1, target_bonus: float = 1.0, fall_penalty: float = 0.0,
-    min_steps_success: int = 3, min_sustain_steps: int = 50,
-    stance_soft: bool = True, forward_pull: float = 0.0, shaping: float = 1.0,
+    min_steps_success: int = 0, min_sustain_steps: int = 50,
+    stance_soft: bool = False, forward_pull: float = 0.0, shaping: float = 1.0,
     # exploration annealing + the SGS bank
-    temp_start: float = 0.05, temp_end: float = 1.0, temp_cycles: int = 50, temp_gate_steps: int = 250,
-    targets: str = '0.05,0.15,0.3,0.5,0.8', bank_kind: str = 'tiers',
-    primed_splits: str = '0.0,0.15,0.3', bank_tiers: int = 6,
-    walk_vxs: str = '0.0,0.05,0.10', walk_phases: str = '0,1.5708,3.1416,4.7124', walk_split_amp: float = 0.15,
+    temp_start: float = 1.0, temp_end: float = 1.0, temp_cycles: int = 0, temp_gate_steps: int = 250,
+    targets: str = '0.0,0.05,0.15,0.3,0.5,0.8',
     stand_scales: str = '0.0,0.5,1.0', stand_commands: str = '',
-    time_features: str = 'off', cpg: bool = False, forced_swing: float = 0.25, phase_reset: float = 0.0,
-    learned_clock: bool = True, clock_band = (0.3, 3.0),
+    time_features: str = 'fourier', cpg: bool = True, forced_swing: float = 0.25, phase_reset: float = 0.0,
+    learned_clock: bool = False, clock_band = (0.3, 3.0),
     target: float = 0.66, kappa: float = 5.0,
-    sgs_eps: float = 1e-4, sgs_window: int = 100, temperature: float = 2.0, sgs_uniform_prob: float = 0.0,
+    sgs_eps: float = 1e-6, sgs_window: int = 100, temperature: float = 2.0, sgs_uniform_prob: float = 0.25,
     # optimization
-    eval_every: int = 3, eval_episodes: int = 128, render: bool = True,
+    eval_every: int = 3, eval_episodes: int = 128, render: bool = True, backend: str = 'mlx',
     epochs: int = 4, batch_size: int = 1024, learning_rate: float = 5e-4, entropy_weight: float = 0.002,
     actor_mlp_depth: int = 2, actor_dim: int = 128, critic_mlp_depth: int = 2, critic_dim: int = 128,
     use_hidden_spr: bool = True, hidden_spr_weight: float = 1.0,
@@ -1838,6 +1685,7 @@ def main(
     rep_align: bool = False, rep_align_weight: float = 1.0, seed: int = 42,
 ):
     torch.set_num_threads(int(os.environ.get('TORCH_THREADS', '8')))
+    assert backend in ('mlx', 'cpu'), f"backend must be mlx / cpu, got {backend}"
 
     if distill and (not cpg or learned_clock):
         # the teacher labels student states by splicing in its own CPG phase:
@@ -1850,9 +1698,8 @@ def main(
     save_path.parent.mkdir(parents = True, exist_ok = True); log_path.parent.mkdir(parents = True, exist_ok = True)
     log_path.write_text('')
 
-    bank = make_gait_bank(bank_kind, targets = targets, stand_scales = stand_scales, stand_commands = stand_commands,
-                          primed_splits = primed_splits, bank_tiers = bank_tiers, walk_vxs = walk_vxs,
-                          walk_phases = walk_phases, walk_split_amp = walk_split_amp)
+    bank = make_stand_bank(scales = _floats(stand_scales), targets = _floats(targets),
+                           commands = _pairs(stand_commands) or None)
 
     sgs_kwargs = dict(target = target, kappa = kappa, eps = sgs_eps, window = sgs_window, temperature = temperature,
                       uniform_prob = sgs_uniform_prob, log_every = 128, log_path = str(log_path.with_name('sgs_progression.csv')), seed = seed)
@@ -1863,7 +1710,12 @@ def main(
         fall_penalty = fall_penalty, min_steps_success = min_steps_success, min_sustain_steps = min_sustain_steps,
         stance_soft = stance_soft, forward_pull = forward_pull, time_features = time_features, cpg = cpg,
         forced_swing = forced_swing, phase_reset = phase_reset, shaping = shaping, bank = bank, sgs = sgs_kwargs,
+        backend = backend,
     )
+
+    if backend == 'cpu':
+        nim = 'on' if getattr(env.env.eng, 'nim_available', False) else 'OFF'
+        print(f'[SGS-gait] backend: mujoco_warp CPU, Nim fast paths {nim}')
 
     print(f'[SGS-gait] {num_envs} ducks, {len(bank)} cells = initial states x targets {targets}, SGS target {target} '
           f'kappa {kappa} eps {sgs_eps}; success = cross the cell target on foot (>= {min_steps_success} steps, '
@@ -2058,7 +1910,7 @@ def main(
 
     # on a mac (mps), show the gait - one full episode each, from the clean stand
 
-    if render and torch.backends.mps.is_available():
+    if render:
         videos = save_path.with_name('videos')
         videos.mkdir(exist_ok = True)
         student_ckpt = Path(student_save_path) if student_save_path else save_path.with_name('student.pt')
@@ -2070,7 +1922,7 @@ def main(
             render_gait(
                 checkpoint = str(ckpt), out_path = str(videos / f'{name}.mp4'), cpg = cpg_mode, horizon = horizon,
                 learned_clock = learned_clock if name == 'teacher' else False, time_features = time_features,
-                latent_id = best_latent if name == 'teacher' else 0,
+                latent_id = best_latent if name == 'teacher' else 0, backend = backend,
             )
             print(f'[SGS-gait] gait video: {videos / f"{name}.mp4"}')
 
