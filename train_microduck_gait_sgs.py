@@ -2,26 +2,27 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["fire", "mujoco", "mlx", "numpy", "torch", "tqdm", "einx", "imageio",
-#     "evolutionary-policy-optimization", "mujoco_warp_lucidrains_fork[mlx,nim]==0.0.5", "env-ssl-wrapper>=0.5.13", "x-ppo==0.0.12", "nimporter-plus", "setuptools"]
+#     "evolutionary-policy-optimization", "mujoco_warp_lucidrains_fork[mlx,nim]==0.0.6", "env-ssl-wrapper>=0.5.13", "x-ppo==0.0.16", "nimporter-plus", "setuptools"]
 # [tool.uv.sources]
 # evolutionary-policy-optimization = { path = ".", editable = true }
+# mujoco_warp_lucidrains_fork = { path = "../mujoco_warp", editable = true }
 # ///
 """Single microduck gait, sparse gait rewards, SGS-chosen initial states.
 
 Success = crossing the cell's target distance on foot while upright; the
 sampler concentrates training on the frontier cells. With --distill, a no-CPG
 student learns from the CPG teacher's labels on its own visited states (online
-DAgger via x-ppo 0.0.12), optionally with representation alignment.
+DAgger via x-ppo 0.0.16), optionally with representation alignment.
 
-Dependencies come from PyPI - uv resolves them, including the fast MLX
-training stack from lucidrains' mujoco_warp fork, published as
-mujoco_warp_lucidrains_fork; the robot model repo (pollen-robotics/microduck_rl)
-is git cloned next to this repo on first run if not already there. The CPG gait
-pattern it distills from (the leg-pattern table, and the clock it rides) lives
-in this file. On a Mac the run ends by rendering the gait it found into
-<run>/videos/{teacher,student}.mp4.
+The CPG clock and sensory-feedback primitives live in cpg.py at the project
+root; the duck's leg-pattern table lives here. `--cpg_adaptive` learns the cadence online from foot contacts. On a Mac
+the run ends by rendering the gait into <run>/videos/{teacher,student}.mp4.
 
   uv run train_microduck_gait_sgs.py --total_env_steps 2000000
+
+CPU-only / force the compiled Nim fast paths:
+
+  uv run train_microduck_gait_sgs.py --nim_cpu True --total_env_steps 2000000
 """
 
 
@@ -44,13 +45,14 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from cpg import CPG, AdaptiveFrequencyOscillator
 from evolutionary_policy_optimization import (
     EPO,
     create_agent,
     rescale_from_to,
 )
 
-from env_ssl_wrapper import SGSSampler, SuccessGuidedSamplingWrapper, fourier_time
+from env_ssl_wrapper import SuccessGuidedSamplingWrapper
 from mujoco_warp.mps.robot import BatchedEngine
 
 
@@ -90,6 +92,7 @@ CPG_ANKLE_SCALE = 0.55
 CPG_ROLL_AMP = 0.035
 CPG_RAMP_CYCLES = 1.0
 CPG_TURN_GAIN = 0.1
+CPG_DRIVE_LPF_HZ = 4.0
 COMMAND_NOMINAL_SPEED = 0.15
 
 LIN_VEL_RANGE = (-0.3, 0.3)
@@ -163,75 +166,17 @@ CAMERA_AZIMUTH = 150
 CAMERA_ELEVATION = -15
 VIDEO_SIZE = (480, 640)
 
-def exists(v):
-    return v is not None
-
-def default(v, d):
-    return v if exists(v) else d
-
-def to_phase(x):
-    """Python numbers become float64 (a clock should not lose precision to a
-    default dtype); tensors and arrays keep their own dtype."""
-    return torch.tensor(x, dtype = torch.float64) if isinstance(x, (int, float)) else torch.as_tensor(x)
-
-class CPG:
-    def __init__(self, freq = 2., dt = .02, phase_reset_gain = 0.):
-        self.freq, self.dt, self.phase_reset_gain = freq, dt, phase_reset_gain
-
-    def waveform(self, phi, amp, phase = 0., rectify = False, bias = 0.):
-        """`(k, dim)` offsets - slot `i` gets `bias[i] + amp[i] * sin(phi + phase[i])`,
-        half-wave rectified where `rectify[i]`; a scalar `phi` gives `(dim,)`."""
-
-        phi = to_phase(phi)
-
-        amp, phase, bias = (torch.as_tensor(x, dtype = phi.dtype, device = phi.device) for x in (amp, phase, bias))
-        rectify = torch.as_tensor(rectify).to(device = phi.device)
-
-        s = torch.sin(phi[..., None] + phase)
-        s = torch.where(rectify, s.clamp(min = 0.), s)
-
-        return bias + amp * s
-
-    def phase_at(self, t_seconds, phi0 = 0., freq = None):
-        """The phase, `phi0` at reset, at episode time `t_seconds`."""
-
-        return (2. * math.pi * default(freq, self.freq) * to_phase(t_seconds) + phi0) % (2. * math.pi)
-
-    def advance(self, phi, freq = None):
-        """One control step of the free-running phase."""
-
-        return (to_phase(phi) + 2. * math.pi * default(freq, self.freq) * self.dt) % (2. * math.pi)
-
-    def phase_reset(self, phi, contact, prev_contact, targets = (math.pi, 0.), gain = None):
-        """A fresh strike nudges the phase toward that foot's canonical touchdown
-        phase (simultaneous strikes: the earliest foot's); contacts come back so
-        the caller keeps the state."""
-
-        gain = default(gain, self.phase_reset_gain)
-        phi = to_phase(phi)
-
-        if gain <= 0.:
-            return phi, prev_contact
-
-        newly = torch.as_tensor(contact, dtype = torch.bool) & ~torch.as_tensor(prev_contact, dtype = torch.bool)
-        target = torch.as_tensor(targets, dtype = phi.dtype, device = phi.device)[newly.int().argmax(dim = -1)]
-        err = (target - phi + math.pi) % (2. * math.pi) - math.pi
-
-        return torch.where(newly.any(dim = -1), (phi + gain * err) % (2. * math.pi), phi), contact
-
-def cpg_waveform(cpg, phi, steps, command, joints, dim, swing = None):
-    """The duck leg pattern as a table on the CPG's sine basis: the model's
-    left/right joints are axis-mirrored, so hips and ankles ride the base phase
-    with the same sign, knees alternate as half-waves off their own phase, hip
-    rolls sit at quarter phase; amplitudes ramp in, the turn command offsets
-    both hip pitches."""
+def cpg_waveform(cpg, phi, steps, command, joints, dim, swing = None, freq = None):
+    """The duck leg pattern on the CPG's sine basis (axis-mirrored hips and
+    ankles, half-wave knees, quarter-phase rolls, turn offset on hip pitch)."""
 
     swing = FORCED_SWING if swing is None else swing
     k = len(phi)
     command = np.asarray(command, np.float64)
+    freq = np.asarray(CPG_FREQ if freq is None else freq, np.float64)
 
     t = np.asarray(steps, np.float64) * (PHYSICS_DT * N_SUBSTEPS)
-    ramp = np.minimum(1., t * CPG_FREQ / CPG_RAMP_CYCLES)
+    ramp = np.minimum(1., t * freq / CPG_RAMP_CYCLES)
     speed = np.clip(np.abs(command[:, 0]) / COMMAND_NOMINAL_SPEED, 0., 1.5)
 
     swing_amp = swing * ramp
@@ -334,7 +279,9 @@ class MicroduckCpuEngine:
     import mujoco_warp
     from mujoco_warp._src import nim_cpu
 
-    self.mjw, self.m = mujoco_warp, mujoco_warp.put_model(model)
+    # large models use the sparse constraint layout + Nim sparse/tree solver
+    sparse = model.nv > 32
+    self.mjw, self.m = mujoco_warp, mujoco_warp.put_model(model, nim_sparse = sparse, nim_tree = sparse)
     self.d = mujoco_warp.make_data(model, nworld = nworld)
     self.nworld, self.nim_available = nworld, nim_cpu.get_ops() is not None
 
@@ -385,7 +332,8 @@ class MicroduckCpuEngine:
 
 def make_engine(model, nworld, backend = 'mlx', coop = True):
   if backend == 'mlx':
-    return MicroduckMlxEngine(model, nworld = nworld, coop = coop)
+    # packed-tree solve is faster once the cooperative kernel is off (large models)
+    return MicroduckMlxEngine(model, nworld = nworld, coop = coop, tree = model.nv >= 64)
 
   if backend == 'cpu':
     return MicroduckCpuEngine(model, nworld)
@@ -404,6 +352,9 @@ class MicroduckMlxBatchedEnv:
     horizon: int = 400,
     seed: int = 0,
     cpg: bool = True,
+    cpg_adaptive: bool = False,
+    cpg_adapt_rate: float = 10.0,
+    cpg_freq_range = (0.5, 4.0),
     forced_swing: float | None = FORCED_SWING,
     fixed_command: tuple | None = None,
     rescale_to=ACTION_INTERFACE_RANGE,
@@ -426,6 +377,7 @@ class MicroduckMlxBatchedEnv:
     self.horizon = horizon
     self.max_episode_length = horizon
     self.cpg = cpg
+    self.cpg_adaptive = bool(cpg_adaptive)
     self.obs_dim = (
       OBS_GRAVITY_DIM + OBS_ANG_VEL_DIM + 3 * self.action_dim + COMMAND_DIM + (OBS_CPG_DIM if self.cpg else 0)
     )
@@ -459,10 +411,20 @@ class MicroduckMlxBatchedEnv:
     self.l_hip_roll = joint_id("left_hip_roll")
     self.r_hip_roll = joint_id("right_hip_roll")
 
-    # the phase clock is the CPG class above; the leg pattern below is the
-    # duck's table on that sine basis
+    # phase clock; the duck's leg-pattern table rides its sine basis
 
     self.cpg_gen = CPG(freq = CPG_FREQ, dt = PHYSICS_DT * N_SUBSTEPS)
+
+    # online cadence adaptation from the contact difference (zero-mean per stride)
+
+    self.cpg_afo = AdaptiveFrequencyOscillator(
+      num = num_envs, freq = CPG_FREQ, dt = PHYSICS_DT * N_SUBSTEPS,
+      adapt_rate = cpg_adapt_rate, freq_range = cpg_freq_range, freq_tau = 2.0,
+    ) if self.cpg_adaptive else None
+    self._cpg_drive = np.zeros(num_envs, np.float64)
+    self._cpg_drive_alpha = 1.0 - math.exp(-2.0 * math.pi * CPG_DRIVE_LPF_HZ * PHYSICS_DT * N_SUBSTEPS)
+    self._cpg_adapt_mask = np.zeros(num_envs, bool)
+
     self.cpg_joints = dict(
       l_hip_pitch = self.l_hip_pitch, r_hip_pitch = self.r_hip_pitch, l_knee = self.l_knee, r_knee = self.r_knee,
       l_ankle = self.l_ankle, r_ankle = self.r_ankle, l_hip_roll = self.l_hip_roll, r_hip_roll = self.r_hip_roll,
@@ -522,32 +484,44 @@ class MicroduckMlxBatchedEnv:
     idx = np.asarray(rows, np.int64).reshape(-1)
     self._reset_cmd[idx] = np.asarray(cmd, np.float64).reshape(len(idx), COMMAND_DIM)
 
-  def _cpg_waveform(self, phi, steps, command):
-    """The duck's leg pattern on the CPG clock (same math as the step-time CPG)."""
-    return cpg_waveform(self.cpg_gen, phi, steps, command, self.cpg_joints, self.action_dim, self.forced_swing)
+  def _cpg_waveform(self, phi, steps, command, freq = None):
+    return cpg_waveform(
+      self.cpg_gen, phi, steps, command, self.cpg_joints, self.action_dim, self.forced_swing, freq = freq
+    )
 
   def cpg_waveform_at(self, t_seconds, command, phi0 = 0.0):
     """CPG waveform at episode time `t_seconds` for a reset-started episode."""
     t = np.asarray(t_seconds, np.float64)
     return self._cpg_waveform(self.cpg_gen.phase_at(t, phi0).numpy(), t / (PHYSICS_DT * N_SUBSTEPS), command)
 
-  def _phase_reset(self, phi, active):
-    """Contact-driven phase reset (Taga & Yamaguchi 1991; Kimura et al. 2007).
-
-    The reset law lives in the CPG class above; the env owns the contact
-    state it needs - which feet touched on the previous step - and reads the
-    fresh contacts off the engine. Gain 0 disables the entrainment.
-    """
+  def _phase_reset(self, phi, active, contact):
+    """Contact-driven phase reset; gain 0 disables the entrainment."""
     gain = self._phase_reset_gain
 
     if gain <= 0.0:
       return phi
 
-    contact = self.foot_contacts[active]
     prev = self._phase_prev_contact[active]
     phi, contact = self.cpg_gen.phase_reset(phi, contact, prev, gain = gain)
     self._phase_prev_contact[active] = contact
     return phi.numpy()
+
+  def _cpg_frequency(self, active, contact):
+    """Learned cadence for the active rows, or the fixed clock."""
+    if not self.cpg_adaptive:
+      return CPG_FREQ
+
+    # low-pass the contact bounce; the AFO state persists across episodes
+    drive = contact[:, 0].astype(np.float64) - contact[:, 1].astype(np.float64)
+    self._cpg_drive[active] = (
+      self._cpg_drive_alpha * drive + (1.0 - self._cpg_drive_alpha) * self._cpg_drive[active]
+    )
+
+    freq = self.cpg_afo.step(
+      torch.as_tensor(self._cpg_drive[active]), dt = self.cpg_gen.dt, rows = active,
+      mask = torch.as_tensor(self._cpg_adapt_mask[active]),
+    )
+    return freq.cpu().numpy()
 
   @property
   def foot_contacts(self):
@@ -668,6 +642,9 @@ class MicroduckMlxBatchedEnv:
     self._foot_air[i] = 0.0
     self._episodes[i] += 1
     self._phi[i] = self._reset_phase[i]
+    self._phase_prev_contact[i] = False
+    self._cpg_adapt_mask[i] = False
+    self._cpg_drive[i] = 0.0
 
     xquat = qpos[QUAT_OFFSET:QUAT_OFFSET + SPATIAL_DIM + 1]
     xquat = xquat / np.linalg.norm(xquat)
@@ -718,10 +695,12 @@ class MicroduckMlxBatchedEnv:
 
     ctrl = self.home_ctrl[None] + ACTION_SCALE * a_eff
     if self.cpg:
-      phi = self._phase_reset(phi, active)
-      cpg_target = self._cpg_waveform(phi, steps, command)
+      contact = self.eng.foot_contacts(self._foot_geoms)[active]
+      freq = self._cpg_frequency(active, contact)
+      phi = self._phase_reset(phi, active, contact)
+      cpg_target = self._cpg_waveform(phi, steps, command, freq = freq)
       ctrl = ctrl + cpg_target
-      phi = self.cpg_gen.advance(phi).numpy()
+      phi = self.cpg_gen.advance(phi, freq = freq).numpy()
 
     self._ctrl_np[active] = ctrl.astype(np.float32)
     self.eng.set_ctrl(self._ctrl_np)
@@ -761,6 +740,11 @@ class MicroduckMlxBatchedEnv:
     trunk_up = self._xmat_trunk[:, :, SPATIAL_DIM - 1]
     uprightness = (trunk_up * up).sum(-1)
     trunk_h = (xpos[:, TRUNK_BODY] * up).sum(-1)
+
+    # the next step may adapt the cadence only from a healthy, moving gait
+    self._cpg_adapt_mask[active] = (
+      (uprightness >= 0.8) & (trunk_h >= 0.09) & (np.abs(command[:, 0]) > COMMAND_EPS) & (steps >= 10)
+    )
 
     finite = np.isfinite(qpos).all(axis=1) & np.isfinite(qvel).all(axis=1)
     terminated = (uprightness < MIN_UPRIGHTNESS) | (trunk_h < MIN_TRUNK_Z)
@@ -1026,6 +1010,9 @@ class DuckGaitVecEnv:
         forward_pull: float = 0.0,
         time_features: str = 'off',
         cpg: bool = False,
+        cpg_adaptive: bool = False,
+        cpg_adapt_rate: float = 10.0,
+        cpg_freq_range = (0.5, 4.0),
         forced_swing: float | None = 0.25,
         phase_reset: float = 0.0,
         shaping: float = 1.0,
@@ -1040,7 +1027,9 @@ class DuckGaitVecEnv:
             learned_clock = learned_clock, clock_band = clock_band, line_step = line_step, line_bonus = line_bonus,
             target_bonus = target_bonus, fall_penalty = fall_penalty, min_steps_success = min_steps_success,
             min_sustain_steps = min_sustain_steps, stance_soft = stance_soft, forward_pull = forward_pull,
-            time_features = time_features, cpg = cpg, forced_swing = forced_swing, phase_reset = phase_reset,
+            time_features = time_features, cpg = cpg, cpg_adaptive = cpg_adaptive, cpg_adapt_rate = cpg_adapt_rate,
+            cpg_freq_range = cpg_freq_range,
+            forced_swing = forced_swing, phase_reset = phase_reset,
             shaping = shaping, bank = bank, sgs = sgs, backend = backend,
         )
         self.horizon = int(horizon)
@@ -1083,6 +1072,7 @@ class DuckGaitVecEnv:
         # restores the pure sparse task.
 
         self.shaping = float(shaping)
+        self.cpg_adaptive = bool(cpg_adaptive)
 
         self.env = MicroduckMlxBatchedEnv(
             Path(mjcf_path) if mjcf_path else MJCF,
@@ -1090,6 +1080,9 @@ class DuckGaitVecEnv:
             horizon = self.horizon,
             seed = seed,
             cpg = cpg,
+            cpg_adaptive = cpg_adaptive,
+            cpg_adapt_rate = cpg_adapt_rate,
+            cpg_freq_range = cpg_freq_range,
             forced_swing = forced_swing,
             fixed_command = (command, 0.0),
             backend = backend,
@@ -1564,6 +1557,7 @@ def render_gait(
     sample: bool = False,
     learned_clock: bool = False,
     cpg: bool = True,
+    cpg_adaptive: bool = False,
     forced_swing: float = 0.25,
     time_features: str = 'fourier',
     backend: str = 'mlx',
@@ -1574,7 +1568,8 @@ def render_gait(
     band = (band[0], band[1]) if len(band) >= 2 else (0.3, 3.0)
 
     env = DuckGaitVecEnv(num_envs = 1, horizon = horizon, seed = seed, learned_clock = learned_clock, clock_band = band,
-                         cpg = cpg, forced_swing = forced_swing, time_features = time_features, backend = backend)
+                         cpg = cpg, cpg_adaptive = cpg_adaptive,
+                         forced_swing = forced_swing, time_features = time_features, backend = backend)
     env._apply_state([0], dict(split = split, phase = phase, tilt = tilt, scale = scale, target = 0.0))
 
     agent, obs_dim = load_agent(checkpoint, num_latents = num_latents)
@@ -1667,16 +1662,18 @@ def main(
     temp_start: float = 1.0, temp_end: float = 1.0, temp_cycles: int = 0, temp_gate_steps: int = 250,
     targets: str = '0.0,0.05,0.15,0.3,0.5,0.8',
     stand_scales: str = '0.0,0.5,1.0', stand_commands: str = '',
-    time_features: str = 'fourier', cpg: bool = True, forced_swing: float = 0.25, phase_reset: float = 0.0,
+    time_features: str = 'fourier', cpg: bool = True, cpg_adaptive: bool = False,
+    cpg_adapt_rate: float = 10.0, cpg_freq_min: float = 0.5, cpg_freq_max: float = 4.0,
+    forced_swing: float = 0.25, phase_reset: float = 0.0,
     learned_clock: bool = False, clock_band = (0.3, 3.0),
     target: float = 0.66, kappa: float = 5.0,
     sgs_eps: float = 1e-6, sgs_window: int = 100, temperature: float = 2.0, sgs_uniform_prob: float = 0.25,
     # optimization
-    eval_every: int = 3, eval_episodes: int = 128, render: bool = True, backend: str = 'mlx',
+    eval_every: int = 3, eval_episodes: int = 128, render: bool = True, backend: str = 'mlx', nim_cpu: bool = False,
     epochs: int = 4, batch_size: int = 1024, learning_rate: float = 5e-4, entropy_weight: float = 0.002,
     actor_mlp_depth: int = 2, actor_dim: int = 128, critic_mlp_depth: int = 2, critic_dim: int = 128,
     use_hidden_spr: bool = True, hidden_spr_weight: float = 1.0,
-    max_grad_norm: float = 0.5, resume_from: str = '',
+    use_hpo: bool = False, max_grad_norm: float = 0.5, resume_from: str = '',
     # online DAgger: a no-CPG student distills from the CPG teacher
     distill: bool = False, student_envs: int = 256, student_rollout_steps: int = 200, student_rollout_every: int = 1,
     distill_epochs: int = 2, distill_batch_size: int = 1024, distill_samples: int = 65536,
@@ -1685,6 +1682,15 @@ def main(
     rep_align: bool = False, rep_align_weight: float = 1.0, seed: int = 42,
 ):
     torch.set_num_threads(int(os.environ.get('TORCH_THREADS', '8')))
+
+    # --nim_cpu forces the CPU backend with the compiled Nim paths, failing
+    # loudly below if they are unavailable
+
+    if nim_cpu:
+        backend = 'cpu'
+        os.environ.pop('MUJOCO_WARP_DISABLE_NIM', None)
+        print('[SGS-gait] --nim_cpu: using mujoco_warp CPU with Nim fast paths')
+
     assert backend in ('mlx', 'cpu'), f"backend must be mlx / cpu, got {backend}"
 
     if distill and (not cpg or learned_clock):
@@ -1693,6 +1699,11 @@ def main(
 
         print('[SGS-gait] distill: forcing cpg True / learned_clock False (teacher obs = student obs + CPG phase)')
         cpg, learned_clock = True, False
+
+    if distill and cpg_adaptive:
+        # the teacher waveform is reconstructed from episode time, so keep the fixed clock
+        print('[SGS-gait] distill: cpg_adaptive off (teacher waveform is reconstructed from time)')
+        cpg_adaptive = False
 
     save_path, log_path = Path(save_path).resolve(), Path(log_path).resolve()
     save_path.parent.mkdir(parents = True, exist_ok = True); log_path.parent.mkdir(parents = True, exist_ok = True)
@@ -1709,6 +1720,8 @@ def main(
         clock_band = clock_band, line_step = line_step, line_bonus = line_bonus, target_bonus = target_bonus,
         fall_penalty = fall_penalty, min_steps_success = min_steps_success, min_sustain_steps = min_sustain_steps,
         stance_soft = stance_soft, forward_pull = forward_pull, time_features = time_features, cpg = cpg,
+        cpg_adaptive = cpg_adaptive, cpg_adapt_rate = cpg_adapt_rate,
+        cpg_freq_range = (cpg_freq_min, cpg_freq_max),
         forced_swing = forced_swing, phase_reset = phase_reset, shaping = shaping, bank = bank, sgs = sgs_kwargs,
         backend = backend,
     )
@@ -1716,6 +1729,9 @@ def main(
     if backend == 'cpu':
         nim = 'on' if getattr(env.env.eng, 'nim_available', False) else 'OFF'
         print(f'[SGS-gait] backend: mujoco_warp CPU, Nim fast paths {nim}')
+
+        if nim_cpu and nim != 'on':
+            raise RuntimeError('--nim_cpu requested but the Nim fast paths are unavailable')
 
     print(f'[SGS-gait] {num_envs} ducks, {len(bank)} cells = initial states x targets {targets}, SGS target {target} '
           f'kappa {kappa} eps {sgs_eps}; success = cross the cell target on foot (>= {min_steps_success} steps, '
@@ -1726,21 +1742,22 @@ def main(
         critic_dim = critic_dim, critic_mlp_depth = critic_mlp_depth, use_critic_ema = False, clip_value = False,
         use_hidden_spr = use_hidden_spr, hidden_spr_weight = hidden_spr_weight, use_diversity_discr = False,
         actor_lr = learning_rate, critic_lr = learning_rate, batch_size = batch_size, max_grad_norm = max_grad_norm,
-        actor_loss_kwargs = dict(entropy_weight = entropy_weight, eps_clip = 0.2, norm_advantages = True), quiet = True,
+        actor_loss_kwargs = dict(entropy_weight = entropy_weight, eps_clip = 0.2, norm_advantages = True, use_hpo = use_hpo), quiet = True,
     )
+
+    print(f'[SGS-gait] actor loss: {"HPO (x-ppo 0.0.16)" if use_hpo else "PPO clip"}')
 
     print(f'[SGS-gait] teacher {init_gait_agent(agent, resume_from)}')
 
     epo = EPO(agent, episodes_per_latent = episodes_per_latent, max_episode_length = horizon, action_sample_temperature = temp_start)
 
-    # online DAgger: the student lives in the same task without the CPG, sees the
-    # same commanded-goal bank, and learns from the teacher's labels on its own
-    # visited states - optionally with representation alignment (x-ppo 0.0.12)
+    # online DAgger: a no-CPG student learns from the teacher's labels on its own states
 
     student = student_env = student_optim = distiller = None
 
     if distill:
         student_env = env.spawn(num_envs = student_envs, seed = seed + 7919, cpg = False, learned_clock = False, phase_reset = 0.0,
+                                cpg_adaptive = False,
                                 sgs = dict(sgs_kwargs, log_every = None, log_path = None, seed = seed + 7919))
 
         student = student_env.to_epo_agent(
@@ -1800,7 +1817,7 @@ def main(
             epochs = distill_epochs, max_grad_norm = 1.0,
         )
 
-        print(f'[SGS-gait] online DAgger (x-ppo 0.0.12): no-CPG student ({student_env.obs_dim} obs / {student_env.action_dim} act)')
+        print(f'[SGS-gait] online DAgger (x-ppo 0.0.16): no-CPG student ({student_env.obs_dim} obs / {student_env.action_dim} act)')
 
     pbar = tqdm(total = total_env_steps, desc = 'SGS gait (single duck)', unit = 'step', dynamic_ncols = True)
     total_steps = cycle = 0
@@ -1865,6 +1882,9 @@ def main(
                 sgs_counts = counts.tolist(), episodes_done = int(env.sgs.sampler.step_count), **env.ep_stats,
             )
 
+            if env.env.cpg_afo is not None:
+                record['cpg_freq'] = float(env.env.cpg_afo.freq.mean())
+
             if cycle % eval_every == 0 or total_steps >= total_env_steps:
                 ev = evaluate(env, agent, num_episodes = eval_episodes, horizon = horizon, latent_id = best_latent)
                 record.update(ev)
@@ -1890,11 +1910,13 @@ def main(
                 agent.save(save_path.with_name('ckpt_last.pt'), overwrite = True)
                 env.sgs.reset()  # the eval scrambled the slots - reseed fresh SGS episodes
 
+                cpg_note = f' | cpg {record["cpg_freq"]:.2f}Hz' if 'cpg_freq' in record else ''
+
                 tqdm.write(
                     f'[c{cycle:04d} | {total_steps/1e6:.2f}M] ret={mean_reward:+.2f} ep_steps={record["ep_steps"]:.0f} succ={record["ep_success"]:.2f} '
                     f'| eval: x={ev["ev_x"]:+.3f} lines={ev["ev_lines"]:.1f} surv={ev["ev_survival"]:.2f} falls={ev["ev_falls"]:.2f} '
                     f'| sgs: {record["sgs_visited"]}/{len(probs)} cells, best rate {record["sgs_best_rate"]:.2f}, '
-                    f'frontier #{frontier} (sc {spec["scale"]:.2f} tgt {spec["target"]:.2f}) p={probs[frontier]:.3f}{st_note}'
+                    f'frontier #{frontier} (sc {spec["scale"]:.2f} tgt {spec["target"]:.2f}) p={probs[frontier]:.3f}{st_note}{cpg_note}'
                 )
             else:
                 with log_path.open('a') as f:
@@ -1921,6 +1943,7 @@ def main(
 
             render_gait(
                 checkpoint = str(ckpt), out_path = str(videos / f'{name}.mp4'), cpg = cpg_mode, horizon = horizon,
+                cpg_adaptive = cpg_adaptive if name == 'teacher' else False,
                 learned_clock = learned_clock if name == 'teacher' else False, time_features = time_features,
                 latent_id = best_latent if name == 'teacher' else 0, backend = backend,
             )

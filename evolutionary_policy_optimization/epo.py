@@ -29,6 +29,7 @@ from torch.utils._pytree import tree_map
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from x_mlps_pytorch import AttnResidualNormedMLP
+from x_ppo import hpo_actor_loss, ppo_actor_loss, spo_actor_loss
 
 from evolutionary_policy_optimization.distributed import all_gather, get_world_and_rank, is_distributed, maybe_barrier, maybe_sync_seed
 
@@ -1863,39 +1864,31 @@ def actor_loss(
     advantages,     # Float[b]
     eps_clip = 0.2,
     entropy_weight = .01,
-    eps = 1e-5,
     norm_advantages = True,
-    use_spo = False
+    use_spo = False,
+    use_hpo = False
 ):
-    batch = advantages.shape[0]
-
     log_probs = sum_to_batch(distr.log_prob(actions))
     entropy = sum_to_batch(distr.entropy())
 
-    ratio = (log_probs - old_log_probs).exp()
-
-    if norm_advantages:
-        advantages = F.layer_norm(advantages, (batch,), eps = eps)
-
-    if use_spo:
-        # simple policy optimization - line 14 Algorithm 1 https://arxiv.org/abs/2401.16025v9
-
-        actor_loss = - (
-            ratio * advantages -
-            advantages.abs() / (2 * eps_clip) * (ratio - 1.).square()
-        )
+    if use_hpo:
+        loss_fn = hpo_actor_loss
+    elif use_spo:
+        loss_fn = spo_actor_loss
     else:
-        # classic clipped surrogate loss from ppo
+        loss_fn = ppo_actor_loss
 
-        clipped_ratio = ratio.clamp(min = 1. - eps_clip, max = 1. + eps_clip)
+    loss = loss_fn(
+        log_probs,
+        old_log_probs,
+        advantages,
+        eps_clip = eps_clip,
+        normalize_advantages = norm_advantages,
+    )
 
-        actor_loss = -torch.min(clipped_ratio * advantages, ratio * advantages)
+    # entropy bonus
 
-    # add entropy loss for exploration
-
-    entropy_aux_loss = -entropy_weight * entropy
-
-    return (actor_loss + entropy_aux_loss).mean()
+    return (loss - entropy_weight * entropy).mean()
 
 # agent contains the actor, critic, and the latent genetic pool
 
