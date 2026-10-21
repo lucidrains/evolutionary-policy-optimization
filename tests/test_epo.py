@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical, TransformedDistribution
 
-from evolutionary_policy_optimization.epo import EPO, Actor, Critic, LatentGenePool, ShuffledBatches, create_agent, shrink_and_perturb_
+from evolutionary_policy_optimization.epo import EPO, Actor, Critic, LatentGenePool, ShouldRunGeneticAlgorithm, ShuffledBatches, create_agent, shrink_and_perturb_
 from evolutionary_policy_optimization.mock_env import Env, VectorEnv
 
 
@@ -433,7 +433,8 @@ def test_e2e_learning_cycle_with_diversity_discr(diversity_time_gap):
         diversity_time_gap = diversity_time_gap,
         latent_gene_pool_kwargs = dict(
             frac_natural_selected = 0.75,
-            frac_tournaments = 0.9
+            frac_tournaments = 0.9,
+            should_run_genetic_algorithm = ShouldRunGeneticAlgorithm(gamma = 0., min_spread = -1.)
         ),
         wrap_with_accelerate = False,
     )
@@ -515,8 +516,115 @@ def test_e2e_vectorized_env(action_is_continuous):
     agent.load('./agent_vec.pt')
 
 
+@pytest.mark.parametrize('action_is_continuous', (False, True))
+def test_diversity_discr_continuous_dads(action_is_continuous):
+    from evolutionary_policy_optimization import DiversityDiscr
+
+    discr = DiversityDiscr(
+        dim_state = 16,
+        dim_latent = 6,
+        dim = 32,
+        depth = 2,
+        time_gap = 1,
+        dim_action = 4,
+        action_is_continuous = action_is_continuous,
+    )
+
+    state = torch.randn(8, 16)
+    next_state = state + torch.randn(8, 16) * 0.1
+    z = torch.randn(8, 6)
+    action = torch.randn(8, 4) if action_is_continuous else torch.randint(0, 4, (8,))
+
+    pred = discr(state, next_state, action = action)
+    assert pred.shape == (8, 6)
+
+    loss = F.mse_loss(pred, z)
+    loss.backward()
+    assert discr.state_proj.weight.grad is not None
+    assert discr.action_proj.weight.grad is not None
+
+def test_fixed_latent_breaks_symmetry():
+    from evolutionary_policy_optimization import create_agent
+
+    agent = create_agent(
+        dim_state = 32,
+        num_latents = 8,
+        dim_latent = 16,
+        actor_num_actions = 6,
+        actor_dim = 32,
+        actor_mlp_depth = 2,
+        critic_dim = 32,
+        critic_mlp_depth = 2,
+        action_is_continuous = True,
+        latent_mode = 'fixed',
+        use_critic_ema = False,
+        wrap_with_accelerate = False,
+    )
+
+    state = torch.randn(64, 32)
+    z1, z2 = torch.zeros(64, 16), torch.ones(64, 16)
+
+    mean1 = agent.get_actor_distribution(state, latent = z1).mean
+    mean2 = agent.get_actor_distribution(state, latent = z2).mean
+
+    assert (mean1 - mean2).abs().mean() > 1e-3
+
+@pytest.mark.parametrize('latent_mode', ('gene_pool', 'fixed'))
+def test_epo_latent_mode_toggle(latent_mode):
+    # original EPO (evolved gene pool) vs fixed latents sampled from N(0, I) + DADS
+
+    from evolutionary_policy_optimization import EPO, create_agent
+
+    fixed = latent_mode == 'fixed'
+    num_latents = 8 if fixed else 4
+
+    agent = create_agent(
+        dim_state = 16,
+        num_latents = num_latents,
+        dim_latent = 6,
+        actor_num_actions = 4,
+        actor_dim = 16,
+        actor_mlp_depth = 2,
+        critic_dim = 16,
+        critic_mlp_depth = 2,
+        latent_mode = latent_mode,
+        use_diversity_discr = fixed,
+        use_critic_ema = False,
+        wrap_with_accelerate = False,
+        latent_gene_pool_kwargs = dict(frac_natural_selected = 0.75, frac_tournaments = 0.9),
+    )
+
+    assert agent.has_latent_genes is (not fixed)
+    assert agent.has_fixed_latents is fixed
+    assert agent.use_diversity_discr is fixed
+
+    # fixed mode has no gene ids - z must come from the sampler
+
+    if fixed:
+        with pytest.raises(AssertionError):
+            agent.get_actor_actions(torch.randn(2, 16), latent_id = 0)
+
+    epo = EPO(agent, episodes_per_latent = 1, max_episode_length = 6, diversity_reward_weight = 0.5)
+    env = VectorEnv(state_shape = 16, num_envs = 8, can_terminate_after = 2)
+
+    memories = epo.gather_experience_from(env)
+    assert memories.cumulative_rewards.shape == (num_latents, 1)
+
+    real = [m for m in memories.memories if int(m.episode_id) != -1]
+    refs = {(tuple(m.latent_gene_id.tolist()) if fixed else int(m.latent_gene_id)) for m in real}
+    assert len(refs) == num_latents
+    assert all(m.latent_gene_id.shape == ((6,) if fixed else ()) for m in real)
+
+    # one cycle warms the discriminator, the second trains against DADS rewards
+
+    epo(env, num_learning_cycles = 2)
+    assert agent.has_diversity_discr_warmed_up.item() is fixed
+
+    agent.save('./agent_latent_mode.pt', overwrite = True)
+    agent.load('./agent_latent_mode.pt')
+
 def test_continuous_beta_details():
-    from evolutionary_policy_optimization import Beta, create_agent
+    from evolutionary_policy_optimization import create_agent
 
     agent = create_agent(
         dim_state = 16,

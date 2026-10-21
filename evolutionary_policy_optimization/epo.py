@@ -15,7 +15,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from accelerate import Accelerator
-from torch.optim import AdamW
 from assoc_scan import AssocScan
 from einops import einsum, rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
@@ -25,6 +24,7 @@ from mean_conc_beta import Beta
 from torch import Tensor, cat, from_numpy, is_tensor, nn, stack, tensor
 from torch.distributions import Categorical, Distribution
 from torch.nn import Linear, Module, ModuleList
+from torch.optim import AdamW
 from torch.utils._pytree import tree_map
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
@@ -438,20 +438,32 @@ class MLP(Module):
         depth,
         dim_latent = 0,
         latent_mapping_network_depth = 2,
-        expansion_factor = 2.
+        expansion_factor = 2.,
+        latent_conditioning = 'film',  # film | concat (direct z injection, x-ppo style)
     ):
         super().__init__()
         dim_latent = default(dim_latent, 0)
 
         self.dim_latent = dim_latent
+        self.latent_conditioning = latent_conditioning
 
         self.needs_latent = dim_latent > 0
 
-        self.encode_latent = nn.Sequential(
-            LatentMappingNetwork(dim_latent, depth = latent_mapping_network_depth),
-            Linear(dim_latent, dim * 2),
-            nn.SiLU()
-        ) if self.needs_latent else None
+        assert latent_conditioning in ('film', 'concat')
+
+        self.encode_latent = None
+
+        if self.needs_latent and latent_conditioning == 'film':
+            self.encode_latent = nn.Sequential(
+                LatentMappingNetwork(dim_latent, depth = latent_mapping_network_depth),
+                Linear(dim_latent, dim * 2),
+                nn.SiLU()
+            )
+
+        self.latent_proj = None
+
+        if self.needs_latent and latent_conditioning == 'concat':
+            self.latent_proj = nn.Linear(dim_latent, dim, bias = False)
 
         dim_hidden = int(dim * expansion_factor)
 
@@ -464,7 +476,7 @@ class MLP(Module):
 
             film = None
 
-            if self.needs_latent:
+            if self.needs_latent and latent_conditioning == 'film':
                 film = FiLM(dim * 2, dim)
 
             lime = DynamicLIMe(dim, num_layers = ind + 1) if not is_first else None
@@ -498,15 +510,16 @@ class MLP(Module):
         assert xnor(self.needs_latent, exists(latent))
 
         if exists(latent):
-            # start with naive concatenative conditioning
-            # but will also offer some alternatives once a spark is seen (film, adaptive linear from stylegan, etc)
-
-            latent = self.encode_latent(latent)
+            if self.latent_conditioning == 'film':
+                latent = self.encode_latent(latent)
 
             if latent.ndim == 1:
                 latent = repeat(latent, 'd -> b d', b = batch)
 
             assert latent.shape[0] == x.shape[0], f'received state with batch size {x.shape[0]} but latent ids received had batch size {latent.shape[0]}'
+
+            if self.latent_conditioning == 'concat':
+                x = x + self.latent_proj(latent)
 
         # layers
 
@@ -528,43 +541,66 @@ class MLP(Module):
 
         return self.final_lime(x, prev_layer_inputs)
 
-# discriminator for predicting latent code from states or state transitions (DIAYN / DADS)
+# discriminator for predicting latent code from states, transitions, and optionally actions (DIAYN / DADS)
 
 class DiversityDiscr(Module):
     def __init__(
         self,
         dim_state,
-        num_latents,
+        num_latents = None,
         dim = 64,
         depth = 2,
-        time_gap = 1
+        time_gap = 1,
+        dim_latent = None,          # continuous latent -> regression head, DADS style
+        dim_action = None,          # condition on action q(z | s, a, s')
+        action_is_continuous = False,
     ):
         super().__init__()
-        self.time_gap = time_gap
+
+        assert exists(num_latents) ^ exists(dim_latent), 'give either num_latents (discrete) or dim_latent (continuous)'
+
         self.state_transition = time_gap > 0
+        self.has_action = exists(dim_action)
+        self.action_is_continuous = action_is_continuous
 
         self.state_proj = nn.Linear(dim_state, dim)
+
+        self.action_proj = None
+
+        if self.has_action:
+            self.action_proj = nn.Linear(dim_action, dim) if action_is_continuous else nn.Embedding(dim_action, dim)
+
+        dim_in = dim * (2 if self.state_transition else 1) + (dim if self.has_action else 0)
+        dim_out = default(dim_latent, num_latents)
 
         self.net = AttnResidualNormedMLP(
             dim = dim,
             depth = depth,
-            dim_in = dim * 2 if self.state_transition else dim,
-            dim_out = num_latents
+            dim_in = dim_in,
+            dim_out = dim_out
         )
 
     def reset_parameters(self):
         for module in self.modules():
-            if isinstance(module, (nn.Linear, nn.LayerNorm, nn.RMSNorm)):
+            if isinstance(module, (nn.Linear, nn.LayerNorm, nn.RMSNorm, nn.Embedding)):
                 module.reset_parameters()
 
-    def forward(self, state, next_state = None):
+    def forward(self, state, next_state = None, action = None):
         state_embed = self.state_proj(state)
 
-        if not self.state_transition or not exists(next_state):
-            return self.net(state_embed)
+        inputs = [state_embed]
 
-        next_state_embed = self.state_proj(next_state)
-        return self.net((state_embed, next_state_embed))
+        if self.state_transition:
+            assert exists(next_state), 'discriminator was built with transitions but no next_state was given'
+            inputs.append(self.state_proj(next_state))
+
+        assert not self.has_action or exists(action), 'discriminator was built with actions but none were given'
+
+        if self.has_action:
+            action_inp = action if self.action_is_continuous else action.long()
+            inputs.append(self.action_proj(action_inp))
+
+        return self.net(inputs[0] if len(inputs) == 1 else tuple(inputs))
 
 # action distributions - the actor always returns a `Distribution`, either
 # categorical (discrete) or beta mean-conc (continuous). beta is defined over
@@ -661,6 +697,7 @@ class Actor(Module):
         dim_latent = 0,
         action_is_continuous = False, # continuous control - beta policy
         beta_kwargs: dict = dict(),
+        latent_conditioning = 'film',
     ):
         super().__init__()
 
@@ -676,7 +713,7 @@ class Actor(Module):
             nn.SiLU()
         )
 
-        self.mlp = MLP(dim = dim, depth = mlp_depth, dim_latent = dim_latent)
+        self.mlp = MLP(dim = dim, depth = mlp_depth, dim_latent = dim_latent, latent_conditioning = latent_conditioning)
 
         if self.beta_actions:
             # beta head - (raw mean, raw concentration) per action dim
@@ -733,7 +770,8 @@ class Critic(Module):
             min_value = 0.,
             max_value = 500.,
             num_bins = 250
-        )
+        ),
+        latent_conditioning = 'film',
     ):
         super().__init__()
 
@@ -746,7 +784,7 @@ class Critic(Module):
             nn.SiLU()
         )
 
-        self.mlp = MLP(dim = dim, depth = mlp_depth, dim_latent = dim_latent)
+        self.mlp = MLP(dim = dim, depth = mlp_depth, dim_latent = dim_latent, latent_conditioning = latent_conditioning)
 
         self.final_norm = nn.RMSNorm(dim)
 
@@ -1253,6 +1291,8 @@ class Agent(Module):
         accelerate_kwargs: dict = dict(),
         accelerator = None,
         quiet: bool = False,
+        latent_mode = 'gene_pool',   # gene_pool (evolved latents) | fixed (sample z ~ N(0, I))
+        num_latents = 1,             # fixed mode: latent samples per rollout cycle
     ):
         super().__init__()
 
@@ -1290,14 +1330,28 @@ class Agent(Module):
             **ema_kwargs
         ) if use_critic_ema else None
 
-        self.latent_gene_pool = latent_gene_pool
-        self.num_latents = latent_gene_pool.num_latents if exists(latent_gene_pool) else 1
-        self.has_latent_genes = exists(latent_gene_pool)
+        assert latent_mode in ('gene_pool', 'fixed')
 
+        self.latent_mode = latent_mode
+        self.latent_gene_pool = latent_gene_pool
+        self.has_latent_genes = exists(latent_gene_pool)
+        self.has_fixed_latents = latent_mode == 'fixed'
+        self.has_latents = self.has_latent_genes or self.has_fixed_latents
+        self.dim_latent = default(actor.dim_latent, 0)
+
+        assert not (self.has_latent_genes and self.has_fixed_latents)
         assert actor.dim_latent == critic.dim_latent
 
         if self.has_latent_genes:
             assert latent_gene_pool.dim_latent == actor.dim_latent
+        elif self.has_fixed_latents:
+            assert self.dim_latent > 0, 'fixed latent mode needs dim_latent > 0'
+
+        self.num_latents = (
+            latent_gene_pool.num_latents if self.has_latent_genes
+            else num_latents if self.has_fixed_latents
+            else 1
+        )
 
         # gae function
 
@@ -1333,13 +1387,27 @@ class Agent(Module):
         self.use_diversity_discr = use_diversity_discr
         self.diversity_time_gap = diversity_time_gap
 
+        self.diversity_discr_loss_fn = F.mse_loss if self.has_fixed_latents else F.cross_entropy
+
         if use_diversity_discr:
-            assert exists(latent_gene_pool), 'latent_gene_pool must be present to use DIAYN / DADS'
+            assert self.has_latents, 'latent gene pool or fixed latents must be present to use DIAYN / DADS'
+
+            if self.has_fixed_latents:
+                assert diversity_time_gap in (0, 1), 'fixed latents support DIAYN (0) or DADS (1) transitions'
+
             dim_state = actor.init_layer[0].in_features
+
+            diversity_discr_kwargs = dict(diversity_discr_kwargs)
+
+            if self.has_fixed_latents:
+                diversity_discr_kwargs['dim_latent'] = self.dim_latent
+                diversity_discr_kwargs['dim_action'] = actor.num_actions
+                diversity_discr_kwargs['action_is_continuous'] = actor.beta_actions
+            else:
+                diversity_discr_kwargs['num_latents'] = latent_gene_pool.num_latents
 
             self.diversity_discr = DiversityDiscr(
                 dim_state = dim_state,
-                num_latents = latent_gene_pool.num_latents,
                 time_gap = diversity_time_gap,
                 **diversity_discr_kwargs
             )
@@ -1350,7 +1418,6 @@ class Agent(Module):
             self.diversity_discr_optim = None
 
         self.clip_value = clip_value
-        self.critic_loss_kwargs = critic_loss_kwargs
 
         # self-predictive representations (SPR)
 
@@ -1373,6 +1440,7 @@ class Agent(Module):
 
         self.register_buffer('has_diversity_discr_warmed_up', tensor(False))
         self.register_buffer('zero', tensor(0.))
+        self.last_diversity_discr_loss = 0.
 
         # shrink and perturb every
 
@@ -1382,7 +1450,7 @@ class Agent(Module):
 
         # promotes latents to be farther apart for diversity maintenance
 
-        self.has_diversity_loss = diversity_aux_loss_weight > 0.
+        self.has_diversity_loss = diversity_aux_loss_weight > 0. and self.has_latent_genes
         self.diversity_aux_loss_weight = diversity_aux_loss_weight
 
         # wrap with accelerate
@@ -1469,6 +1537,9 @@ class Agent(Module):
             actor = unwrap(self.actor).state_dict(),
             critic = unwrap(self.critic).state_dict(),
             critic_ema = self.critic_ema.state_dict() if self.use_critic_ema else None,
+            latent_mode = self.latent_mode,
+            num_latents = self.num_latents,
+            dim_latent = self.dim_latent,
             latents = unwrap(self.latent_gene_pool).state_dict() if self.has_latent_genes else None,
             diversity_discr = unwrap(self.diversity_discr).state_dict() if self.use_diversity_discr else None,
             diversity_time_gap = self.diversity_time_gap,
@@ -1492,6 +1563,9 @@ class Agent(Module):
 
         pkg = torch.load(str(path), weights_only = True)
 
+        if 'latent_mode' in pkg:
+            assert pkg['latent_mode'] == self.latent_mode, 'checkpoint latent_mode does not match the agent'
+
         unwrap(self.actor).load_state_dict(pkg['actor'])
         unwrap(self.critic).load_state_dict(pkg['critic'])
 
@@ -1499,6 +1573,7 @@ class Agent(Module):
             self.critic_ema.load_state_dict(pkg['critic_ema'])
 
         if 'latents' in pkg and exists(pkg['latents']):
+            assert self.has_latent_genes, 'checkpoint carries a latent gene pool but agent is in fixed latent mode'
             unwrap(self.latent_gene_pool).load_state_dict(pkg['latents'])
 
         if self.use_diversity_discr and 'diversity_discr' in pkg and exists(pkg['diversity_discr']):
@@ -1540,6 +1615,8 @@ class Agent(Module):
 
         if not exists(latent) and exists(latent_id) and exists(self.latent_gene_pool):
             latent = maybe_unwrap(self.latent_gene_pool)(latent_id = latent_id)
+
+        assert not self.has_fixed_latents or exists(latent), 'fixed latent mode needs a latent sampled from N(0, I)'
 
         return maybe_unwrap(self.actor)(state, latent, temperature = temperature)
 
@@ -1586,6 +1663,8 @@ class Agent(Module):
 
         if not exists(latent) and exists(latent_id) and exists(self.latent_gene_pool):
             latent = maybe_unwrap(self.latent_gene_pool)(latent_id = latent_id)
+
+        assert not self.has_fixed_latents or exists(latent), 'fixed latent mode needs a latent sampled from N(0, I)'
 
         critic_forward = maybe_unwrap(self.critic)
 
@@ -1634,7 +1713,7 @@ class Agent(Module):
             episode_ids,
             states,
             next_states,
-            latent_gene_ids,
+            latent_refs,
             actions,
             log_probs,
             rewards,
@@ -1656,7 +1735,7 @@ class Agent(Module):
 
         valid_episode = episode_ids >= 0
 
-        fields = tuple(t[valid_episode] for t in (advantages, states, next_states, latent_gene_ids, actions, log_probs, values, dones))
+        fields = tuple(t[valid_episode] for t in (advantages, states, next_states, latent_refs, actions, log_probs, values, dones))
 
         if self.wrap_with_accelerate or self.use_dataloader:
             dataloader = DataLoader(TensorDataset(*fields), batch_size = self.batch_size, shuffle = True)
@@ -1671,12 +1750,15 @@ class Agent(Module):
         self.actor.train()
         self.critic.train()
 
+        if self.use_diversity_discr:
+            self.diversity_discr.train()
+
         for _ in tqdm(range(epochs), desc = 'learning actor/critic epoch', disable = self.quiet or not self.is_main_process):
             for (
                 advantages,
                 states,
                 next_states,
-                latent_gene_ids,
+                latent_refs,
                 actions,
                 log_probs,
                 old_values,
@@ -1684,11 +1766,13 @@ class Agent(Module):
             ) in dataloader:
 
                 if self.has_latent_genes:
-                    latents = self.latent_gene_pool(latent_id = latent_gene_ids)
+                    latents = self.latent_gene_pool(latent_id = latent_refs)
 
                     orig_latents = latents
                     latents = latents.detach()
                     latents.requires_grad_()
+                elif self.has_fixed_latents:
+                    latents = latent_refs
                 else:
                     latents = None
 
@@ -1757,8 +1841,10 @@ class Agent(Module):
 
                 if self.use_diversity_discr:
                     discr_inp = (states,) if self.diversity_time_gap == 0 else (states, next_states)
-                    diversity_discr_logits = self.diversity_discr(*discr_inp)
-                    diversity_discr_loss = F.cross_entropy(diversity_discr_logits, latent_gene_ids)
+                    diversity_discr_pred = self.diversity_discr(*discr_inp, action = actions)
+                    diversity_discr_loss = self.diversity_discr_loss_fn(diversity_discr_pred, latent_refs)
+
+                    self.last_diversity_discr_loss = float(diversity_discr_loss.detach())
 
                     diversity_discr_loss.backward()
 
@@ -1905,6 +1991,7 @@ def create_agent(
     use_critic_ema = True,
     use_state_norm = False,
     action_is_continuous = False, # continuous control - beta policy
+    latent_mode = 'gene_pool',    # gene_pool (evolved latents) | fixed (sample z ~ N(0, I))
     diversity_time_gap = 1,
     latent_gene_pool_kwargs: dict = dict(),
     actor_kwargs: dict = dict(),
@@ -1912,9 +1999,13 @@ def create_agent(
     **kwargs
 ) -> Agent:
 
-    has_latent_genes = num_latents > 1
+    assert latent_mode in ('gene_pool', 'fixed')
 
-    if not has_latent_genes:
+    has_latent_genes = latent_mode == 'gene_pool' and num_latents > 1
+
+    if latent_mode == 'fixed':
+        assert exists(dim_latent) and dim_latent > 0, 'fixed latent mode needs dim_latent > 0'
+    elif not has_latent_genes:
         dim_latent = None
 
     latent_gene_pool = LatentGenePool(
@@ -1924,6 +2015,14 @@ def create_agent(
     ) if has_latent_genes else None
 
     state_norm = StateNorm(dim = dim_state) if use_state_norm else None
+
+    actor_kwargs = dict(actor_kwargs)
+    critic_kwargs = dict(critic_kwargs)
+
+    latent_conditioning = 'concat' if latent_mode == 'fixed' else 'film'
+
+    actor_kwargs.setdefault('latent_conditioning', latent_conditioning)
+    critic_kwargs.setdefault('latent_conditioning', latent_conditioning)
 
     actor = Actor(
         num_actions = actor_num_actions,
@@ -1950,6 +2049,8 @@ def create_agent(
         critic = critic,
         state_norm = state_norm,
         latent_gene_pool = latent_gene_pool,
+        latent_mode = latent_mode,
+        num_latents = num_latents,
         use_critic_ema = use_critic_ema,
         diversity_time_gap = diversity_time_gap,
         **kwargs
@@ -1959,6 +2060,8 @@ def create_agent(
 
 # EPO - which is just PPO with natural selection of a population of latent variables conditioning the agent
 # the tricky part is that the latent ids for each episode / trajectory needs to be tracked
+
+# latent_gene_id is a pool index in gene_pool mode, or the sampled z in fixed mode
 
 Memory = namedtuple('Memory', [
     'episode_id',
@@ -2048,7 +2151,7 @@ class EPO(Module):
         self.action_sample_temperature = action_sample_temperature
         self.diversity_reward_weight = diversity_reward_weight
 
-        self.num_latents = agent.latent_gene_pool.num_latents if agent.has_latent_genes else 1
+        self.num_latents = agent.num_latents
         self.episodes_per_latent = episodes_per_latent
         self.max_episode_length = max_episode_length
         self.fix_environ_across_latents = fix_environ_across_latents
@@ -2144,7 +2247,12 @@ class EPO(Module):
 
             latent_id, episode_id, maybe_seed = rollout
 
-            latent = self.agent.unwrapped_latent_gene_pool(latent_id = latent_id) if self.agent.has_latent_genes else None
+            if self.agent.has_latent_genes:
+                latent = self.agent.unwrapped_latent_gene_pool(latent_id = latent_id)
+            elif self.agent.has_fixed_latents:
+                latent = torch.randn(self.agent.dim_latent, device = self.device)
+            else:
+                latent = None
 
             seed = maybe_seed if fix_environ_across_latents else None
             state, _ = interface_torch_numpy(env.reset_one, device = self.device)(i, seed = seed)
@@ -2156,6 +2264,12 @@ class EPO(Module):
 
         pbar = tqdm(total = num_episodes, desc = 'rollout', disable = self.agent.quiet or not self.agent.is_main_process)
 
+        # some vec envs return the full batch even when only `active` rows were stepped
+
+        def active_rows(x, active):
+            x = np.asarray(x)
+            return x[active] if x.shape[0] != len(active) else x
+
         # each iteration, batch all active slots through the actor and critic,
         # then step the env - slots that finish are refilled and the batch
         # stays full until all episodes have been rolled out
@@ -2164,17 +2278,38 @@ class EPO(Module):
             active = [i for i, slot in enumerate(slots) if exists(slot)]
 
             obs = stack([slots[i].state for i in active])
-            latents = stack([slots[i].latent for i in active]) if self.agent.has_latent_genes else None
+            latents = stack([slots[i].latent for i in active]) if self.agent.has_latents else None
 
             actions, log_probs = self.agent.get_actor_actions(obs, latent = latents, sample = True, temperature = self.action_sample_temperature, use_unwrapped_model = True)
             values = self.agent.get_critic_values(obs, latent = latents, use_ema_if_available = True, use_unwrapped_model = True)
 
             next_obs, rewards, terminated, truncated = env.step_batch(actions.cpu().numpy(), worker_ids = active)[:4]
 
-            next_states = from_numpy(np.ascontiguousarray(next_obs)).float().to(self.device)
-            rewards = from_numpy(np.asarray(rewards)).float().to(self.device)
-            terminated = from_numpy(np.asarray(terminated)).to(self.device)
-            truncated = from_numpy(np.asarray(truncated)).to(self.device)
+            next_states = from_numpy(np.ascontiguousarray(active_rows(next_obs, active))).float().to(self.device)
+            rewards = from_numpy(active_rows(rewards, active)).float().to(self.device)
+            terminated = from_numpy(active_rows(terminated, active)).to(self.device)
+            truncated = from_numpy(active_rows(truncated, active)).to(self.device)
+
+            # DADS / DIAYN intrinsic reward, batched over every active env
+
+            diversity_rewards = None
+            time_gap = self.agent.diversity_time_gap
+
+            if self.agent.use_diversity_discr and self.agent.has_diversity_discr_warmed_up.item() and time_gap <= 1:
+                with torch.no_grad():
+                    discr = self.agent.unwrap_model(self.agent.diversity_discr)
+
+                    if self.agent.has_fixed_latents:
+                        # -mse(q(z | s, a, s'), z) - Sharma et al. https://arxiv.org/abs/1907.01657
+
+                        pred = discr(obs, action = actions) if time_gap == 0 else discr(obs, next_states, action = actions)
+                        diversity_rewards = -F.mse_loss(pred, latents, reduction = 'none').mean(dim = -1)
+                    else:
+                        logits = discr(obs) if time_gap == 0 else discr(obs, next_states)
+                        latent_log_probs = logits.log_softmax(dim = -1)
+
+                        latent_ids = tensor([slots[i].latent_id for i in active], device = self.device)
+                        diversity_rewards = latent_log_probs.gather(1, latent_ids[:, None]).squeeze(1) + math.log(self.agent.num_latents)
 
             for k, worker in enumerate(active):
                 slot = slots[worker]
@@ -2187,19 +2322,16 @@ class EPO(Module):
 
                 # maybe diversity reward for the latent
 
-                if self.agent.use_diversity_discr and self.agent.has_diversity_discr_warmed_up.item():
+                if exists(diversity_rewards):
+                    reward = reward + self.diversity_reward_weight * diversity_rewards[k].item()
+                elif self.agent.use_diversity_discr and self.agent.has_diversity_discr_warmed_up.item():
+                    # only the discrete > 1 time-gap case falls back to per-transition
+
                     with torch.no_grad():
                         discr = self.agent.unwrap_model(self.agent.diversity_discr)
-                        time_gap = self.agent.diversity_time_gap
+                        past_state = slot.memories[-(time_gap - 1)].state if len(slot.memories) >= (time_gap - 1) else state
 
-                        if time_gap == 0:
-                            logits = discr(rearrange(state, '... -> 1 ...'))
-                        elif time_gap == 1 or len(slot.memories) < (time_gap - 1):
-                            logits = discr(rearrange(state, '... -> 1 ...'), rearrange(next_state, '... -> 1 ...'))
-                        else:
-                            past_state = slot.memories[-(time_gap - 1)].state
-                            logits = discr(rearrange(past_state, '... -> 1 ...'), rearrange(next_state, '... -> 1 ...'))
-
+                        logits = discr(rearrange(past_state, '... -> 1 ...'), rearrange(next_state, '... -> 1 ...'))
                         latent_log_probs = logits.log_softmax(dim = -1)
                         diversity_reward = latent_log_probs[0, latent_id] + math.log(self.agent.num_latents)
 
@@ -2211,7 +2343,7 @@ class EPO(Module):
                     tensor(episode_id),
                     state,
                     next_state,
-                    tensor(latent_id),
+                    latent.detach().cpu() if self.agent.has_fixed_latents else tensor(latent_id),
                     actions[k],
                     log_probs[k],
                     reward,
@@ -2224,7 +2356,6 @@ class EPO(Module):
                 slot.memories.append(memory)
 
                 if self.agent.use_diversity_discr and self.agent.diversity_time_gap > 1:
-                    time_gap = self.agent.diversity_time_gap
                     if len(slot.memories) >= time_gap:
                         slot.memories[-time_gap] = slot.memories[-time_gap]._replace(next_state = next_state)
 

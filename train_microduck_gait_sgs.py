@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["fire", "mujoco", "mlx", "numpy", "torch", "tqdm", "einx", "imageio",
-#     "evolutionary-policy-optimization", "mujoco_warp_lucidrains_fork[mlx,nim]==0.0.6", "env-ssl-wrapper>=0.5.13", "x-ppo==0.0.16", "nimporter-plus", "setuptools"]
+#     "evolutionary-policy-optimization", "mujoco_warp_lucidrains_fork[mlx,nim]==0.0.6", "env-ssl-wrapper>=0.5.13", "x-ppo==0.0.21", "nimporter-plus", "setuptools"]
 # [tool.uv.sources]
 # evolutionary-policy-optimization = { path = ".", editable = true }
 # mujoco_warp_lucidrains_fork = { path = "../mujoco_warp", editable = true }
@@ -10,15 +10,23 @@
 """Single microduck gait, sparse gait rewards, SGS-chosen initial states.
 
 Success = crossing the cell's target distance on foot while upright; the
-sampler concentrates training on the frontier cells. With --distill, a no-CPG
-student learns from the CPG teacher's labels on its own visited states (online
-DAgger via x-ppo 0.0.16), optionally with representation alignment.
+sampler concentrates training on the frontier cells. By default the actor is
+conditioned on a fixed latent sampled from N(0, I) per episode and DADS rewards
+the discriminator's ability to recover it; pass --latent_mode=gene_pool to use
+the original evolved EPO pool. With --distill, a no-CPG student learns from the
+CPG teacher's labels on its own visited states (online DAgger via x-ppo 0.0.21),
+optionally with representation alignment.
 
 The CPG clock and sensory-feedback primitives live in cpg.py at the project
-root; the duck's leg-pattern table lives here. `--cpg_adaptive` learns the cadence online from foot contacts. On a Mac
-the run ends by rendering the gait into <run>/videos/{teacher,student}.mp4.
+root; the duck's leg-pattern table lives here. `--cpg_adaptive` learns the
+cadence online from foot contacts. On a Mac the run ends by rendering the gait
+into <run>/videos/ - fixed latents render the top eval latents as teacher_z*.mp4.
 
   uv run train_microduck_gait_sgs.py --total_env_steps 2000000
+
+  # original evolved EPO pool
+  uv run train_microduck_gait_sgs.py --latent_mode=gene_pool \
+    --num_latents=32 --episodes_per_latent=32
 
 CPU-only / force the compiled Nim fast paths:
 
@@ -43,6 +51,9 @@ import mlx.core as mx
 import mujoco
 import numpy as np
 import torch
+import torch.nn.functional as F
+from env_ssl_wrapper import SuccessGuidedSamplingWrapper
+from mujoco_warp.mps.robot import BatchedEngine
 from tqdm import tqdm
 
 from cpg import CPG, AdaptiveFrequencyOscillator
@@ -51,10 +62,6 @@ from evolutionary_policy_optimization import (
     create_agent,
     rescale_from_to,
 )
-
-from env_ssl_wrapper import SuccessGuidedSamplingWrapper
-from mujoco_warp.mps.robot import BatchedEngine
-
 
 # prerequisites: the robot model repo is required for the MJCF; clone it next
 # to this repo if not already there
@@ -893,16 +900,24 @@ def _pairs(v):
         out.append((float(bits[0]), float(bits[1]) if len(bits) > 1 else 0.0))
 
     return tuple(out)
+
 @torch.no_grad()
-def evaluate(env: DuckGaitVecEnv, agent, num_episodes = 128, horizon = 400, latent_id = 0, reach = 0.35):
+def evaluate(env: DuckGaitVecEnv, agent, num_episodes = 128, horizon = 400, latent_id = 0, latent = None, reach = 0.35):
     """Greedy eval from the clean stand: distance, lines, foot steps, falls.
 
     `ev_lines` is standing-gated progress (same credit the env pays), and
     `ev_reach` the fraction of eval episodes that walk `reach` metres upright.
+    `latent` is either one fixed vector or one row per episode for fixed latents.
     """
 
     n = min(num_episodes, env.num_envs)
     rows = np.arange(n, dtype = np.int64)
+
+    if latent is not None:
+        latent = torch.as_tensor(latent).float()
+        latent = latent.expand(n, -1) if latent.ndim == 1 else latent[:n]
+        assert latent.shape[0] == n
+
     env._active = rows
     env._apply_state(rows, dict(split = 0.0, phase = 0.0, tilt = 0.0, scale = 0.0, target = 0.0))
 
@@ -923,7 +938,8 @@ def evaluate(env: DuckGaitVecEnv, agent, num_episodes = 128, horizon = 400, late
             break
 
         state = torch.from_numpy(np.ascontiguousarray(env._obs[idx])).float()
-        action = agent.get_actor_actions(state, latent_id = latent_id, sample = False, use_unwrapped_model = True)
+        latent_batch = latent[idx] if latent is not None else None
+        action = agent.get_actor_actions(state, latent_id = latent_id, latent = latent_batch, sample = False, use_unwrapped_model = True)
         joint_targets = env._synthesize(action.numpy().astype(np.float32), idx) if env.learned_clock else action.numpy()
 
         obs, _, term, trunc, _ = env.env.step_batch(joint_targets, worker_ids = idx)
@@ -983,6 +999,70 @@ def evaluate(env: DuckGaitVecEnv, agent, num_episodes = 128, horizon = 400, late
         ev_steps = float(n_steps.mean()),
         ev_survival = float(surv_steps.mean() / horizon),
         ev_falls = float(fell.mean()),
+    )
+
+@torch.no_grad()
+def evaluate_latents(env, agent, zs, num_episodes = 128, horizon = 400):
+    """Spread the eval budget over independently sampled fixed latents."""
+
+    per = max(1, num_episodes // len(zs))
+    per_latent_evals = [evaluate(env, agent, num_episodes = per, horizon = horizon, latent = z) for z in zs]
+    per_latent_x = [e['ev_x'] for e in per_latent_evals]
+    best_latent = int(np.argmax(per_latent_x))
+
+    eval_metrics = {k: float(np.mean([e[k] for e in per_latent_evals])) for k in per_latent_evals[0]}
+    eval_metrics.update(
+        ev_best_latent_x = per_latent_x[best_latent],
+        ev_best_latent_lines = per_latent_evals[best_latent]['ev_lines'],
+        ev_latent_x = [round(x, 4) for x in per_latent_x],
+        ev_latent_x_std = float(np.std(per_latent_x)),
+        ev_latent_x_range = float(np.ptp(per_latent_x)),
+        ev_latent_lines_std = float(np.std([e['ev_lines'] for e in per_latent_evals])),
+    )
+
+    return eval_metrics, zs[best_latent].clone()
+
+@torch.no_grad()
+def dads_metrics(agent, memories, max_samples = 4096):
+    """Held-out DADS skill identifiability: q(z | s, a, s') MSE against the true
+    episode z, versus the same prediction against shuffled z. `dads_r2` near 1
+    means behavior is strongly latent-specific; near 0 means it is not."""
+
+    if not (agent.use_diversity_discr and agent.has_fixed_latents):
+        return {}
+
+    real = [m for m in memories if int(m.episode_id) != -1]
+
+    if not real:
+        return {}
+
+    if len(real) > max_samples:
+        indices = np.random.choice(len(real), max_samples, replace = False)
+        real = [real[i] for i in indices]
+
+    states = torch.stack([m.state for m in real]).to(agent.device)
+    next_states = torch.stack([m.next_state for m in real]).to(agent.device)
+    actions = torch.stack([m.action for m in real]).to(agent.device)
+    z = torch.stack([m.latent_gene_id for m in real]).to(agent.device)
+
+    discr = agent.unwrap_model(agent.diversity_discr)
+    discr.eval()
+
+    pred = discr(states, next_states, action = actions)
+    mse = F.mse_loss(pred, z)
+    shuffled = z[torch.randperm(len(z), device = z.device)]
+    mse_shuffled = F.mse_loss(pred, shuffled)
+
+    per_sample = ((pred - z) ** 2).mean(dim = -1)
+
+    return dict(
+        dads_mse = float(mse),
+        dads_mse_shuffled = float(mse_shuffled),
+        dads_mse_std = float(per_sample.std()),
+        dads_mse_min = float(per_sample.min()),
+        dads_mse_max = float(per_sample.max()),
+        dads_r2 = float(1. - mse / mse_shuffled.clamp(min = 1e-8)),
+        dads_reward = float(-mse),
     )
 
 class DuckGaitVecEnv:
@@ -1517,21 +1597,45 @@ def init_gait_agent(agent, resume_from = ''):
 
 # rendering
 
+def infer_dim_latent(pkg):
+    actor = pkg['actor']
+
+    for key in ('mlp.latent_proj.weight', 'mlp.encode_latent.1.weight'):
+        if key in actor:
+            return int(actor[key].shape[1])
+
+    return 32
+
 def load_agent(checkpoint: str, num_latents: int = 0):
 
     pkg = torch.load(str(checkpoint), map_location = 'cpu', weights_only = True)
     obs_dim = int(pkg['actor']['init_layer.0.weight'].shape[1])
     num_actions = int(pkg['actor']['to_out.1.weight'].shape[0]) // 2
 
-    if num_latents <= 0 and pkg.get('latents') is not None:
+    latent_mode = pkg.get('latent_mode', 'gene_pool')
+    dim_latent = int(pkg['dim_latent']) if 'dim_latent' in pkg else infer_dim_latent(pkg)
+
+    if latent_mode == 'fixed':
+        num_latents = 1
+    elif num_latents <= 0 and pkg.get('latents') is not None:
         num_latents = int(pkg['latents']['latents'].shape[0])
 
     num_latents = num_latents if num_latents > 0 else 32
 
+    use_diversity_discr = pkg.get('diversity_discr') is not None
+
     agent = build_epo_agent(
         obs_dim,
         num_actions,
-        dict(num_latents = num_latents, dim_latent = 32, use_critic_ema = False, use_hidden_spr = False, use_diversity_discr = False, quiet = True),
+        dict(
+            num_latents = num_latents,
+            dim_latent = dim_latent,
+            latent_mode = latent_mode,
+            use_critic_ema = False,
+            use_hidden_spr = False,
+            use_diversity_discr = use_diversity_discr,
+            quiet = True
+        ),
     )
 
     agent.unwrap_model(agent.actor).load_state_dict(pkg['actor'])
@@ -1539,6 +1643,9 @@ def load_agent(checkpoint: str, num_latents: int = 0):
 
     if pkg.get('latents') is not None and agent.has_latent_genes:
         agent.unwrap_model(agent.latent_gene_pool).load_state_dict(pkg['latents'])
+
+    if use_diversity_discr:
+        agent.unwrap_model(agent.diversity_discr).load_state_dict(pkg['diversity_discr'])
 
     agent.eval()
     return agent, obs_dim
@@ -1553,6 +1660,8 @@ def render_gait(
     horizon: int = 400,
     seed: int = 0,
     latent_id: int = 0,
+    latent = None,
+    latent_seed: int = 0,
     num_latents: int = 0,
     sample: bool = False,
     learned_clock: bool = False,
@@ -1574,6 +1683,9 @@ def render_gait(
 
     agent, obs_dim = load_agent(checkpoint, num_latents = num_latents)
 
+    if agent.has_fixed_latents and latent is None:
+        latent = torch.randn(agent.dim_latent, generator = torch.Generator().manual_seed(latent_seed))
+
     if obs_dim != env.obs_dim:
         raise SystemExit(f'checkpoint expects obs_dim {obs_dim}, env provides {env.obs_dim}')
 
@@ -1593,7 +1705,7 @@ def render_gait(
         state = torch.from_numpy(np.ascontiguousarray(env._obs[[0]])).float()
 
         with torch.no_grad():
-            action = agent.get_actor_actions(state, latent_id = latent_id, sample = sample, use_unwrapped_model = True)
+            action = agent.get_actor_actions(state, latent_id = latent_id, latent = latent, sample = sample, use_unwrapped_model = True)
 
         if isinstance(action, tuple):
             action = action[0]
@@ -1637,7 +1749,7 @@ def render_gait(
     trace_path = out.with_suffix('.trace.json')
     trace_path.write_text(json.dumps(dict(
         checkpoint = str(checkpoint), start = str(start), tilt = tilt, scale = scale,
-        latent_id = latent_id, frames = len(frames),
+        latent_id = latent_id, latent_seed = latent_seed, frames = len(frames),
         x_end = trace[-1]['x'] if trace else None,
         min_uprightness = round(min(t['uprightness'] for t in trace), 3) if trace else None,
         trace = trace,
@@ -1652,7 +1764,11 @@ def render_gait(
 
 def main(
     save_path: str = 'experiments/gait_sgs_wrapped/ckpt.pt', log_path: str = 'experiments/gait_sgs_wrapped/metrics.jsonl',
-    total_env_steps: int = 2_000_000, num_envs: int = 1024, num_latents: int = 32, episodes_per_latent: int = 32,
+    total_env_steps: int = 2_000_000, num_envs: int = 1024, num_latents: int = 1024, episodes_per_latent: int = 1,
+    latent_mode: str = 'fixed', dim_latent: int = 8,
+    use_diversity_discr: bool | None = None, diversity_reward_weight: float = 1.0,
+    diversity_time_gap: int = 1, diversity_discr_dim: int = 64, diversity_discr_depth: int = 2,
+    diversity_discr_lr: float = 3e-4, eval_latents: int = 16, render_latents: int = 6,
     # task
     horizon: int = 400, command_speed: float = 0.15, line_step: float = 0.05,
     line_bonus: float = 0.1, target_bonus: float = 1.0, fall_penalty: float = 0.0,
@@ -1682,6 +1798,14 @@ def main(
     rep_align: bool = False, rep_align_weight: float = 1.0, seed: int = 42,
 ):
     torch.set_num_threads(int(os.environ.get('TORCH_THREADS', '8')))
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    assert latent_mode in ('gene_pool', 'fixed'), f'latent_mode must be gene_pool / fixed, got {latent_mode}'
+    assert not (distill and latent_mode == 'fixed'), 'online DAgger currently needs the gene-pool latent mode'
+
+    if use_diversity_discr is None:
+        use_diversity_discr = latent_mode == 'fixed'
 
     # --nim_cpu forces the CPU backend with the compiled Nim paths, failing
     # loudly below if they are unavailable
@@ -1732,24 +1856,40 @@ def main(
 
         if nim_cpu and nim != 'on':
             raise RuntimeError('--nim_cpu requested but the Nim fast paths are unavailable')
+    else:
+        import mujoco_warp
+        print(f'[SGS-gait] backend: mujoco_warp MLX ({mujoco_warp.__file__})')
 
     print(f'[SGS-gait] {num_envs} ducks, {len(bank)} cells = initial states x targets {targets}, SGS target {target} '
           f'kappa {kappa} eps {sgs_eps}; success = cross the cell target on foot (>= {min_steps_success} steps, '
           f'sustained >= {min_sustain_steps}) before the episode ends')
 
     agent = env.to_epo_agent(
-        num_latents = num_latents, dim_latent = 32, actor_dim = actor_dim, actor_mlp_depth = actor_mlp_depth,
+        num_latents = num_latents, dim_latent = dim_latent, actor_dim = actor_dim, actor_mlp_depth = actor_mlp_depth,
         critic_dim = critic_dim, critic_mlp_depth = critic_mlp_depth, use_critic_ema = False, clip_value = False,
-        use_hidden_spr = use_hidden_spr, hidden_spr_weight = hidden_spr_weight, use_diversity_discr = False,
+        use_hidden_spr = use_hidden_spr, hidden_spr_weight = hidden_spr_weight,
+        latent_mode = latent_mode, use_diversity_discr = use_diversity_discr, diversity_time_gap = diversity_time_gap,
+        diversity_discr_kwargs = dict(dim = diversity_discr_dim, depth = diversity_discr_depth),
+        diversity_discr_lr = diversity_discr_lr,
         actor_lr = learning_rate, critic_lr = learning_rate, batch_size = batch_size, max_grad_norm = max_grad_norm,
         actor_loss_kwargs = dict(entropy_weight = entropy_weight, eps_clip = 0.2, norm_advantages = True, use_hpo = use_hpo), quiet = True,
     )
 
-    print(f'[SGS-gait] actor loss: {"HPO (x-ppo 0.0.16)" if use_hpo else "PPO clip"}')
+    print(f'[SGS-gait] actor loss: {"HPO (x-ppo 0.0.21)" if use_hpo else "PPO clip"}')
+
+    diversity_note = f'DADS weight {diversity_reward_weight}' if use_diversity_discr else 'no DADS'
+    fixed_note = f' ({dim_latent}d, {num_latents} sampled per cycle, {diversity_note})' if latent_mode == 'fixed' else ''
+    print(f'[SGS-gait] latent mode: {latent_mode}{fixed_note}')
 
     print(f'[SGS-gait] teacher {init_gait_agent(agent, resume_from)}')
 
-    epo = EPO(agent, episodes_per_latent = episodes_per_latent, max_episode_length = horizon, action_sample_temperature = temp_start)
+    epo = EPO(
+        agent,
+        episodes_per_latent = episodes_per_latent,
+        max_episode_length = horizon,
+        action_sample_temperature = temp_start,
+        diversity_reward_weight = diversity_reward_weight,
+    )
 
     # online DAgger: a no-CPG student learns from the teacher's labels on its own states
 
@@ -1817,11 +1957,19 @@ def main(
             epochs = distill_epochs, max_grad_norm = 1.0,
         )
 
-        print(f'[SGS-gait] online DAgger (x-ppo 0.0.16): no-CPG student ({student_env.obs_dim} obs / {student_env.action_dim} act)')
+        print(f'[SGS-gait] online DAgger (x-ppo 0.0.21): no-CPG student ({student_env.obs_dim} obs / {student_env.action_dim} act)')
 
-    pbar = tqdm(total = total_env_steps, desc = 'SGS gait (single duck)', unit = 'step', dynamic_ncols = True)
+    pbar = tqdm(total = total_env_steps, desc = 'SGS gait (single duck)', unit = 'step', unit_scale = True, dynamic_ncols = True)
     total_steps = cycle = 0
-    ep_steps_recent, best_walk, t_start = None, -float('inf'), time.time()
+    ep_steps_recent, best_forward_x, t_start = None, -float('inf'), time.time()
+
+    last_eval_metrics = dict(ev_x = float('nan'), ev_lines = float('nan'), ev_survival = float('nan'), ev_latent_x_range = float('nan'))
+    eval_zs = None
+    last_latent_eval = None
+    if latent_mode == 'fixed':
+        eval_latents = max(1, min(eval_latents, eval_episodes))
+        eval_zs = torch.randn(eval_latents, dim_latent, generator = torch.Generator().manual_seed(seed + 12345))
+        best_eval_z = eval_zs[0].clone()
 
     try:
         while total_steps < total_env_steps:
@@ -1840,17 +1988,27 @@ def main(
                 epo.action_sample_temperature = want
 
             t0 = time.perf_counter()
-            m = epo.gather_experience_from(env)
+            rollout = epo.gather_experience_from(env)
             t_gather = time.perf_counter() - t0
 
-            total_steps += len(m.memories)
+            steps_this_cycle = len(rollout.memories)
+            total_steps += steps_this_cycle
+
+            # held-out DADS check before the discriminator is updated on this batch
+
+            dads_stats = dads_metrics(agent, rollout.memories)
+
             t0 = time.perf_counter()
-            _, fitness = agent.learn_from(m, epochs = epochs)
+            _, fitness = agent.learn_from(rollout, epochs = epochs)
             t_learn = time.perf_counter() - t0
 
-            mean_reward = float(m.cumulative_rewards.mean().item())
+            mean_reward = float(rollout.cumulative_rewards.mean().item())
             ep_steps_recent = float(env.ep_stats['ep_steps'])
-            best_latent = int(fitness.argmax().item()) if (fitness is not None and agent.has_latent_genes) else 0
+
+            if fitness is not None and agent.has_latent_genes:
+                best_latent = int(fitness.argmax().item())
+            else:
+                best_latent = -1 if agent.has_fixed_latents else 0
 
             # DAgger step: the student rolls out on its own no-CPG states, the
             # teacher labels them, the student fits the growing buffer
@@ -1880,20 +2038,29 @@ def main(
                 sgs_best_rate = float(rates[scored].max()) if scored.any() else 0.0,
                 sgs_probs = np.round(probs, 4).tolist(), sgs_rates = np.round(np.nan_to_num(rates, nan = -1.0), 3).tolist(),
                 sgs_counts = counts.tolist(), episodes_done = int(env.sgs.sampler.step_count), **env.ep_stats,
+                dads_discr_loss = float(agent.last_diversity_discr_loss),
+                **dads_stats,
             )
 
             if env.env.cpg_afo is not None:
                 record['cpg_freq'] = float(env.env.cpg_afo.freq.mean())
 
             if cycle % eval_every == 0 or total_steps >= total_env_steps:
-                ev = evaluate(env, agent, num_episodes = eval_episodes, horizon = horizon, latent_id = best_latent)
-                record.update(ev)
+                if agent.has_fixed_latents:
+                    eval_metrics, best_eval_z = evaluate_latents(env, agent, eval_zs, eval_episodes, horizon)
+                    record['best_latent'] = -1
+                    last_latent_eval = (eval_zs.clone(), eval_metrics['ev_latent_x'])
+                else:
+                    eval_metrics = evaluate(env, agent, num_episodes = eval_episodes, horizon = horizon, latent_id = best_latent)
+
+                record.update(eval_metrics)
+                last_eval_metrics = eval_metrics
                 st_note = ''
 
                 if distill:
                     # the student is evaluated with the teacher, same protocol
-                    st_ev = evaluate(student_env, student, num_episodes = eval_episodes, horizon = horizon, latent_id = 0)
-                    record.update({f'st_{k[3:]}': v for k, v in st_ev.items()})
+                    student_eval_metrics = evaluate(student_env, student, num_episodes = eval_episodes, horizon = horizon, latent_id = 0)
+                    record.update({f'st_{k[3:]}': v for k, v in student_eval_metrics.items()})
                     student.save(Path(student_save_path) if student_save_path else save_path.with_name('student.pt'), overwrite = True)
 
                     align = s_breakdown.alignment if s_breakdown is not None else None
@@ -1903,8 +2070,8 @@ def main(
                 with log_path.open('a') as f:
                     f.write(json.dumps(record) + '\n')
 
-                if ev['ev_x'] > best_walk:
-                    best_walk = ev['ev_x']
+                if eval_metrics['ev_x'] > best_forward_x:
+                    best_forward_x = eval_metrics['ev_x']
                     agent.save(save_path, overwrite = True)
 
                 agent.save(save_path.with_name('ckpt_last.pt'), overwrite = True)
@@ -1914,7 +2081,7 @@ def main(
 
                 tqdm.write(
                     f'[c{cycle:04d} | {total_steps/1e6:.2f}M] ret={mean_reward:+.2f} ep_steps={record["ep_steps"]:.0f} succ={record["ep_success"]:.2f} '
-                    f'| eval: x={ev["ev_x"]:+.3f} lines={ev["ev_lines"]:.1f} surv={ev["ev_survival"]:.2f} falls={ev["ev_falls"]:.2f} '
+                    f'| eval: x={eval_metrics["ev_x"]:+.3f} lines={eval_metrics["ev_lines"]:.1f} surv={eval_metrics["ev_survival"]:.2f} falls={eval_metrics["ev_falls"]:.2f} '
                     f'| sgs: {record["sgs_visited"]}/{len(probs)} cells, best rate {record["sgs_best_rate"]:.2f}, '
                     f'frontier #{frontier} (sc {spec["scale"]:.2f} tgt {spec["target"]:.2f}) p={probs[frontier]:.3f}{st_note}{cpg_note}'
                 )
@@ -1922,8 +2089,17 @@ def main(
                 with log_path.open('a') as f:
                     f.write(json.dumps(record) + '\n')
 
-            pbar.update(min(len(m.memories), max(0, total_env_steps - pbar.n)))
-            pbar.set_postfix(cycle = cycle, ret = f'{mean_reward:+.2f}', sgs = f'{record["sgs_visited"]}/{len(probs)}')
+            pbar.update(min(steps_this_cycle, max(0, total_env_steps - pbar.n)))
+            pbar.set_postfix(
+                cycle = cycle,
+                reward = f'{mean_reward:+.1f}',
+                forward_x = f'{last_eval_metrics.get("ev_x", float("nan")):+.3f}',
+                x_spread = f'{last_eval_metrics.get("ev_latent_x_range", float("nan")):.3f}',
+                eval_lines = f'{last_eval_metrics.get("ev_lines", float("nan")):.1f}',
+                eval_survival = f'{last_eval_metrics.get("ev_survival", float("nan")):.2f}',
+                dads_r2 = f'{dads_stats.get("dads_r2", float("nan")):.2f}',
+                sgs_cells = f'{record["sgs_visited"]}/{len(probs)}',
+            )
 
     finally:
         agent.save(save_path.with_name('ckpt_last.pt'), overwrite = True)
@@ -1941,13 +2117,26 @@ def main(
             if name == 'student' and not distill:
                 continue
 
-            render_gait(
-                checkpoint = str(ckpt), out_path = str(videos / f'{name}.mp4'), cpg = cpg_mode, horizon = horizon,
+            common = dict(
+                checkpoint = str(ckpt), cpg = cpg_mode, horizon = horizon,
                 cpg_adaptive = cpg_adaptive if name == 'teacher' else False,
-                learned_clock = learned_clock if name == 'teacher' else False, time_features = time_features,
-                latent_id = best_latent if name == 'teacher' else 0, backend = backend,
+                learned_clock = learned_clock if name == 'teacher' else False,
+                time_features = time_features, backend = backend,
             )
-            print(f'[SGS-gait] gait video: {videos / f"{name}.mp4"}')
+
+            if name == 'teacher' and agent.has_fixed_latents and last_latent_eval is not None and render_latents > 0:
+                zs, scores = last_latent_eval
+                order = np.argsort(scores)[::-1][:render_latents]
+
+                for rank, zi in enumerate(order):
+                    out = ('teacher.mp4' if rank == 0 else f'teacher_z{rank}.mp4')
+                    render_gait(out_path = str(videos / out), latent = zs[zi], latent_seed = int(zi), **common)
+                    print(f'[SGS-gait] gait video: {videos / out} (latent {int(zi)}, eval x {scores[zi]:+.3f})')
+            else:
+                latent_kwargs = dict(latent = best_eval_z) if (name == 'teacher' and agent.has_fixed_latents) else dict(latent_id = best_latent if name == 'teacher' else 0)
+
+                render_gait(out_path = str(videos / f'{name}.mp4'), **latent_kwargs, **common)
+                print(f'[SGS-gait] gait video: {videos / f"{name}.mp4"}')
 
 if __name__ == '__main__':
     fire.Fire(main)
