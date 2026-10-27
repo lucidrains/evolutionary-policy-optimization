@@ -812,11 +812,6 @@ class Critic(Module):
         use_improved = True
     ):
 
-        if exists(self.state_norm):
-            with torch.no_grad():
-                self.state_norm.eval()
-                state = self.state_norm(state)
-
         logits = self.forward(state, latent, return_logits = True)
 
         if not clip_value or not exists(old_values) or not exists(eps_clip):
@@ -853,6 +848,22 @@ class Critic(Module):
 
         return value_loss.mean()
 
+    def latent(
+        self,
+        state,
+        latent
+    ) -> Tensor:
+        # hidden embedding right before the value projection
+
+        if exists(self.state_norm):
+            with torch.no_grad():
+                self.state_norm.eval()
+                state = self.state_norm(state)
+
+        hidden = self.init_layer(state)
+
+        return self.final_norm(self.mlp(hidden, latent))
+
     def forward(
         self,
         state,
@@ -860,11 +871,7 @@ class Critic(Module):
         return_logits = False
     ):
 
-        hidden = self.init_layer(state)
-
-        hidden = self.mlp(hidden, latent)
-
-        hidden = self.final_norm(hidden)
+        hidden = self.latent(state, latent)
 
         if self.use_regression:
             return self.to_pred(hidden)
@@ -1261,7 +1268,9 @@ class Agent(Module):
         actor_loss_kwargs: dict = dict(
             eps_clip = 0.2,
             entropy_weight = .01,
-            norm_advantages = True
+            norm_advantages = True,
+            use_hpo = True,
+            per_action_dim = True
         ),
         clip_value = False,
         critic_loss_kwargs: dict = dict(
@@ -1645,7 +1654,7 @@ class Agent(Module):
 
         actions = mode_action(distr) if temperature <= 0. else distr.sample()
 
-        log_probs = sum_to_batch(distr.log_prob(actions))
+        log_probs = distr.log_prob(actions)
 
         return actions, log_probs
 
@@ -1945,22 +1954,24 @@ class Agent(Module):
 
 def actor_loss(
     distr,
-    old_log_probs,  # Float[b]
+    old_log_probs,  # Float[b] or Float[b l]
     actions,        # Int[b], or Float[b l] for beta
     advantages,     # Float[b]
     eps_clip = 0.2,
     entropy_weight = .01,
     norm_advantages = True,
     use_spo = False,
-    use_hpo = False
+    use_hpo = True,
+    per_action_dim = True,
+    **loss_kwargs
 ):
-    log_probs = sum_to_batch(distr.log_prob(actions))
+    log_probs = distr.log_prob(actions)
     entropy = sum_to_batch(distr.entropy())
 
-    if use_hpo:
-        loss_fn = hpo_actor_loss
-    elif use_spo:
+    if use_spo:
         loss_fn = spo_actor_loss
+    elif use_hpo:
+        loss_fn = hpo_actor_loss
     else:
         loss_fn = ppo_actor_loss
 
@@ -1970,6 +1981,8 @@ def actor_loss(
         advantages,
         eps_clip = eps_clip,
         normalize_advantages = norm_advantages,
+        per_action_dim = per_action_dim,
+        **loss_kwargs
     )
 
     # entropy bonus

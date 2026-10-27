@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["fire", "mujoco", "mlx", "numpy", "torch", "tqdm", "einx", "imageio",
-#     "evolutionary-policy-optimization", "mujoco_warp_lucidrains_fork[mlx,nim]==0.0.6", "env-ssl-wrapper>=0.5.13", "x-ppo==0.0.21", "nimporter-plus", "setuptools"]
+#     "evolutionary-policy-optimization", "mujoco_warp_lucidrains_fork[mlx,nim]==0.0.6", "env-ssl-wrapper>=0.5.13", "x-ppo==0.0.27", "nimporter-plus", "setuptools"]
 # [tool.uv.sources]
 # evolutionary-policy-optimization = { path = ".", editable = true }
 # mujoco_warp_lucidrains_fork = { path = "../mujoco_warp", editable = true }
@@ -14,8 +14,9 @@ sampler concentrates training on the frontier cells. By default the actor is
 conditioned on a fixed latent sampled from N(0, I) per episode and DADS rewards
 the discriminator's ability to recover it; pass --latent_mode=gene_pool to use
 the original evolved EPO pool. With --distill, a no-CPG student learns from the
-CPG teacher's labels on its own visited states (online DAgger via x-ppo 0.0.21),
-optionally with representation alignment.
+CPG teacher's labels on its own visited states (online DAgger via x-ppo 0.0.27),
+optionally with representation alignment. Pass --use_contact_aux to train an
+anticipatory contact head on the actor / critic hidden states.
 
 The CPG clock and sensory-feedback primitives live in cpg.py at the project
 root; the duck's leg-pattern table lives here. `--cpg_adaptive` learns the
@@ -51,7 +52,10 @@ import mlx.core as mx
 import mujoco
 import numpy as np
 import torch
+from torch import nn
 import torch.nn.functional as F
+from einops import rearrange, reduce
+from einops.layers.torch import Rearrange
 from env_ssl_wrapper import SuccessGuidedSamplingWrapper
 from mujoco_warp.mps.robot import BatchedEngine
 from tqdm import tqdm
@@ -407,6 +411,17 @@ class MicroduckMlxBatchedEnv:
       [i for i in range(self.model.nbody) if i not in self._foot_bodies and i != 0]
     )
     self._floor_clip_eps = 0.02
+
+    # robot geoms follow the single floor geom, grouped by body id 1..nbody-1
+
+    geom_bodyid = self.model.geom_bodyid[1:]
+    assert (geom_bodyid > 0).all()
+    self._body_geom_starts = np.array(
+      [int(np.flatnonzero(geom_bodyid == b)[0]) for b in range(1, self.model.nbody)], dtype=np.int64
+    )
+    self._non_foot_body_idx0 = self._non_foot_bodies - 1
+    self._body_contact_z_thresh = 0.035
+    self.num_contact_bodies = self.model.nbody - 1
 
     joint_id = lambda name: mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name) - 1  # noqa: E731
     self.l_hip_pitch = joint_id("left_hip_pitch")
@@ -822,12 +837,22 @@ class MicroduckMlxBatchedEnv:
 
     obs = self._observe(qpos, qvel, self._xmat_trunk, ang_local, command, self._last_action[active], phi)
     bad = ~finite
+
+    # 15-body ground contact / proximity (2 feet + 13 non-foot 3D body points)
+    geom_z = np.where(bad[:, None], 1.0, geom_xpos[:, 1:, 2])
+    body_min_z = np.minimum(
+      np.minimum.reduceat(geom_z, self._body_geom_starts, axis = 1),
+      np.where(bad[:, None], 1.0, xpos[:, 1:, 2]),
+    )
+    non_foot_contact = (body_min_z[:, self._non_foot_body_idx0] <= self._body_contact_z_thresh).astype(np.float32)
+    body_contacts = np.concatenate([foot_contact.astype(np.float32), non_foot_contact], axis = 1)
+
     if bad.any():
       obs = np.where(bad[:, None], self._safe_obs(command, self._last_action[active], phi), obs)
       reward = np.where(bad, NAN_PENALTY, reward)
       terminated = terminated | bad
 
-    return obs, reward.astype(np.float32), terminated, np.where(bad, False, truncated), {}
+    return obs, reward.astype(np.float32), terminated, np.where(bad, False, truncated), dict(body_contacts = body_contacts)
 
   def set_attr(self, key: str, value):
     setattr(self, key, value)
@@ -1365,7 +1390,7 @@ class DuckGaitVecEnv:
         acts = actions[rows] if actions.shape[0] == self.num_envs else actions.reshape(len(rows), self.action_dim)
 
         joint_targets = self._synthesize(acts, rows) if self.learned_clock else acts
-        obs, env_rew, terminated, truncated, _ = self.env.step_batch(joint_targets, worker_ids = rows)
+        obs, env_rew, terminated, truncated, env_info = self.env.step_batch(joint_targets, worker_ids = rows)
         env_rew = np.asarray(env_rew, np.float32)
 
         x = np.asarray(self.env.eng.qpos)[rows, 0].astype(np.float64)
@@ -1473,12 +1498,17 @@ class DuckGaitVecEnv:
         prog_out = np.zeros(self.num_envs, np.float32); prog_out[rows] = progress
         steps_out = np.zeros(self.num_envs, np.int64); steps_out[rows] = self._steps[rows]
 
+        body_contacts_out = np.zeros((self.num_envs, self.env.num_contact_bodies), np.float32)
+        if 'body_contacts' in env_info:
+            body_contacts_out[rows] = env_info['body_contacts']
+
         info = dict(
             episode_done = done,
             episode_success = success,
             episode_progress = prog_out,
             episode_target = self._target.copy(),
             episode_steps = steps_out,
+            body_contacts = body_contacts_out,
         )
 
         return self._obs.copy(), reward, term, trunc, info
@@ -1537,6 +1567,296 @@ class DuckGaitVecEnv:
     @property
     def counts(self):
         return self.sgs.counts
+
+# anticipatory contact aux - predict future contact bins from actor / critic hidden
+
+def exists(v):
+    return v is not None
+
+def default(v, d):
+    return v if exists(v) else d
+
+def future_contact_bins(contacts, num_bins = 4, bin_width = 5, mode = 'any'):
+    # (t c) -> targets (t b c), mask (t b); bin b is the b-th future window
+    assert mode in ('any', 'mean')
+
+    contacts = torch.as_tensor(contacts, dtype = torch.float32)
+    steps = contacts.shape[0]
+    horizon = num_bins * bin_width
+
+    windows = F.pad(contacts[1:], (0, 0, 0, horizon)).unfold(0, horizon, 1)
+    windows = rearrange(windows, 't c (b w) -> t b w c', b = num_bins)
+    targets = reduce(windows, 't b w c -> t b c', 'max' if mode == 'any' else 'mean')
+
+    t = torch.arange(steps)[:, None]
+    b = torch.arange(num_bins)[None, :]
+    mask = (t + (b + 1) * bin_width) < steps
+
+    return targets, mask
+
+class AnticipatoryContactHead(nn.Module):
+    def __init__(
+        self,
+        dim,
+        num_actions,
+        num_contacts,
+        num_bins,
+        num_feet = 2,
+        dim_action = 32,
+        body_loss_share = 0.5,
+        dim_critic = None
+    ):
+        super().__init__()
+        self.num_bins = num_bins
+        self.num_contacts = num_contacts
+        self.num_feet = min(num_feet, num_contacts)
+        self.body_loss_share = body_loss_share
+
+        dim_out = num_bins * num_contacts
+        dim_critic = default(dim_critic, dim)
+
+        self.to_bins = Rearrange('... (b c) -> ... b c', b = num_bins, c = num_contacts)
+
+        self.action_proj = nn.Sequential(
+            nn.Linear(num_actions, dim_action),
+            nn.SiLU(),
+            nn.Linear(dim_action, dim_action)
+        )
+
+        self.film = nn.Linear(dim_action, dim * 2, bias = False)
+        nn.init.zeros_(self.film.weight)
+
+        self.state_head = nn.Sequential(
+            nn.RMSNorm(dim),
+            nn.Linear(dim, dim_out)
+        )
+
+        self.net = nn.Sequential(
+            nn.RMSNorm(dim + dim_action),
+            nn.Linear(dim + dim_action, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim_out)
+        )
+
+        self.critic_net = nn.Sequential(
+            nn.RMSNorm(dim_critic),
+            nn.Linear(dim_critic, dim_critic),
+            nn.SiLU(),
+            nn.Linear(dim_critic, dim_out)
+        )
+
+    def predict(self, hidden, action):
+        action_emb = self.action_proj(action)
+        gamma, beta = self.film(action_emb).chunk(2, dim = -1)
+        hidden_cond = hidden * (gamma + 1.) + beta
+
+        logits = self.state_head(hidden) + self.net(torch.cat((hidden_cond, action_emb), dim = -1))
+        return self.to_bins(logits)
+
+    def predict_critic(self, hidden):
+        return self.to_bins(self.critic_net(hidden))
+
+    def bce(self, logits, targets, mask):
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction = 'none')
+        mask_f = mask[..., None].float()
+        denom = mask_f.sum().clamp(min = 1.)
+
+        per_channel = (bce * mask_f).sum(dim = (0, 1)) / denom
+        foot = per_channel[:self.num_feet].mean()
+        body = per_channel[self.num_feet:].mean()
+
+        loss = torch.lerp(foot, body, self.body_loss_share) if self.num_contacts > self.num_feet else foot
+        return loss, foot, body
+
+    @torch.no_grad()
+    def stats(self, logits, targets, mask, loss, foot, body):
+        correct = ((logits >= 0.) == (targets >= 0.5)).float()
+        mask_f = mask[..., None].float()
+        denom = mask_f.sum().clamp(min = 1.)
+
+        per_channel = (correct * mask_f).sum(dim = (0, 1)) / denom
+        per_bin = (correct * mask_f).sum(dim = (0, 2)) / (mask_f.sum(dim = (0, 2)) * self.num_contacts).clamp(min = 1.)
+
+        return dict(
+            loss = float(loss),
+            foot_acc = float(per_channel[:self.num_feet].mean()),
+            body_acc = float(per_channel[self.num_feet:].mean()) if self.num_contacts > self.num_feet else float('nan'),
+            bin_acc = per_bin.tolist()
+        )
+
+    def loss(self, hidden, action, targets, mask, critic = False):
+        logits = self.predict_critic(hidden) if critic else self.predict(hidden, action)
+        loss, foot, body = self.bce(logits, targets, mask)
+        return loss, self.stats(logits, targets, mask, loss, foot, body)
+
+class AnticipatoryContactAux(nn.Module):
+    def __init__(
+        self,
+        actor,
+        critic,
+        env,
+        actor_optim,
+        critic_optim,
+        num_bins = 4,
+        bin_width = 5,
+        num_contacts = 15,
+        num_feet = 2,
+        body_loss_share = 0.5,
+        bin_mode = 'any',
+        weight = 0.5,
+        max_grad_norm = 0.5,
+        max_episode_length = 400,
+        lr = 3e-4
+    ):
+        super().__init__()
+        self.actor = actor
+        self.critic = critic
+        self.weight = weight
+        self.max_grad_norm = max_grad_norm
+        self.max_episode_length = max_episode_length
+        self.num_bins = num_bins
+        self.bin_width = bin_width
+        self.bin_mode = bin_mode
+        self.num_contacts = num_contacts
+
+        self.head = AnticipatoryContactHead(
+            dim = actor.dim,
+            num_actions = actor.num_actions,
+            num_contacts = num_contacts,
+            num_bins = num_bins,
+            num_feet = num_feet,
+            body_loss_share = body_loss_share,
+            dim_critic = critic.init_layer[0].out_features
+        )
+        self.optim = torch.optim.AdamW(self.head.parameters(), lr = lr, weight_decay = 0.)
+        self.opts = [opt for opt in (actor_optim, critic_optim, self.optim) if exists(opt)]
+
+        self._last_state = None
+        self._last_latent = None
+        self._steps = [[] for _ in range(env.num_envs)]
+        self._buffer = []
+
+        actor.register_forward_pre_hook(self._capture_state, with_kwargs = True)
+
+        self.attach_env(env)
+
+    def _capture_state(self, _, args, __):
+        if torch.is_grad_enabled() or not torch.is_tensor(args[0]):
+            return
+
+        self._last_state = args[0].detach().cpu()
+        latent = args[1] if len(args) > 1 else None
+        self._last_latent = latent.detach().cpu() if torch.is_tensor(latent) else None
+
+    def attach_env(self, env):
+        reset_one, step_batch = env.reset_one, env.step_batch
+
+        def reset(worker, seed = None):
+            self._steps[int(worker)] = []
+            return reset_one(worker, seed = seed)
+
+        def step(actions, worker_ids = None):
+            out = step_batch(actions, worker_ids = worker_ids)
+            info = out[4] if len(out) > 4 and isinstance(out[4], dict) else {}
+
+            if 'body_contacts' not in info or not exists(self._last_state):
+                return out
+
+            active = np.arange(env.num_envs) if not exists(worker_ids) else np.asarray(list(worker_ids), np.int64)
+            contacts = np.asarray(info['body_contacts'], np.float32)[..., :self.num_contacts]
+            terminated, truncated = np.asarray(out[2], bool), np.asarray(out[3], bool)
+            actions = torch.as_tensor(actions, dtype = torch.float32).cpu()
+
+            for k, w in enumerate(active):
+                w = int(w)
+                latent = self._last_latent[k] if exists(self._last_latent) else None
+                self._steps[w].append((self._last_state[k], latent, actions[k], contacts[k]))
+
+                if not (terminated[k] or truncated[k] or len(self._steps[w]) >= self.max_episode_length):
+                    continue
+
+                traj, self._steps[w] = self._steps[w], []
+
+                targets, mask = future_contact_bins(
+                    np.stack([s[3] for s in traj]),
+                    num_bins = self.num_bins,
+                    bin_width = self.bin_width,
+                    mode = self.bin_mode
+                )
+
+                if not mask.any():
+                    continue
+
+                has_latent = exists(traj[0][1])
+                self._buffer.append((
+                    torch.stack([s[0] for s in traj]),
+                    torch.stack([s[1] for s in traj]) if has_latent else None,
+                    torch.stack([s[2] for s in traj]),
+                    targets,
+                    mask
+                ))
+
+            return out
+
+        env.reset_one, env.step_batch = reset, step
+        return env
+
+    def step(self, epochs = 4, batch_size = 1024):
+        if not self._buffer:
+            return {}
+
+        device = next(self.head.parameters()).device
+        states, latents, actions, targets, masks = zip(*self._buffer)
+        self._buffer.clear()
+
+        states = torch.cat(states).to(device)
+        actions = torch.cat(actions).to(device)
+        targets = torch.cat(targets).to(device)
+        masks = torch.cat(masks).to(device)
+        has_latents = exists(latents[0])
+        latents = torch.cat(latents).to(device) if has_latents else None
+
+        self.head.train()
+        self.actor.train()
+        self.critic.train()
+
+        stats = []
+
+        for _ in range(epochs):
+            for idx in torch.randperm(len(states), device = device).split(batch_size):
+                lat = latents[idx] if has_latents else None
+
+                actor_hidden = self.actor.latent(states[idx], lat)
+                loss, actor_stats = self.head.loss(actor_hidden, actions[idx], targets[idx], masks[idx])
+                stats.append(actor_stats)
+
+                critic_hidden = self.critic.latent(states[idx], lat)
+                critic_loss, _ = self.head.loss(critic_hidden, None, targets[idx], masks[idx], critic = True)
+                loss = loss + critic_loss
+
+                for opt in self.opts:
+                    opt.zero_grad()
+
+                (self.weight * loss).backward()
+
+                if exists(self.max_grad_norm):
+                    for module in (self.actor, self.critic, self.head):
+                        nn.utils.clip_grad_norm_(module.parameters(), self.max_grad_norm)
+
+                for opt in self.opts:
+                    opt.step()
+                    opt.zero_grad()
+
+        def mean(vals):
+            vals = np.asarray(vals, dtype = np.float64)
+            return float(np.nanmean(vals)) if not np.isnan(vals).all() else float('nan')
+
+        return dict(
+            contact_aux_loss = mean([s['loss'] for s in stats]),
+            contact_foot_acc = mean([s['foot_acc'] for s in stats]),
+            contact_body_acc = mean([s['body_acc'] for s in stats]),
+            contact_bin_acc = [mean([s['bin_acc'][b] for s in stats]) for b in range(self.num_bins)]
+        )
 
 # agent
 
@@ -1789,7 +2109,10 @@ def main(
     epochs: int = 4, batch_size: int = 1024, learning_rate: float = 5e-4, entropy_weight: float = 0.002,
     actor_mlp_depth: int = 2, actor_dim: int = 128, critic_mlp_depth: int = 2, critic_dim: int = 128,
     use_hidden_spr: bool = True, hidden_spr_weight: float = 1.0,
-    use_hpo: bool = False, max_grad_norm: float = 0.5, resume_from: str = '',
+    use_contact_aux: bool = False, contact_aux_weight: float = 0.5,
+    contact_num_bins: int = 4, contact_bin_width: int = 5, contact_bodies: str = 'full',
+    contact_bin_mode: str = 'any', contact_body_loss_share: float = 0.5,
+    use_hpo: bool = True, per_action_dim: bool = True, max_grad_norm: float = 0.5, resume_from: str = '',
     # online DAgger: a no-CPG student distills from the CPG teacher
     distill: bool = False, student_envs: int = 256, student_rollout_steps: int = 200, student_rollout_every: int = 1,
     distill_epochs: int = 2, distill_batch_size: int = 1024, distill_samples: int = 65536,
@@ -1864,6 +2187,14 @@ def main(
           f'kappa {kappa} eps {sgs_eps}; success = cross the cell target on foot (>= {min_steps_success} steps, '
           f'sustained >= {min_sustain_steps}) before the episode ends')
 
+    contact_num_channels = 0
+
+    if use_contact_aux:
+        assert contact_bodies in ('full', 'feet'), f"contact_bodies must be 'full' or 'feet', got {contact_bodies!r}"
+        assert contact_bin_mode in ('any', 'mean'), f"contact_bin_mode must be 'any' or 'mean', got {contact_bin_mode!r}"
+        assert contact_num_bins * contact_bin_width < horizon, 'contact lookahead must be shorter than the episode'
+        contact_num_channels = env.env.num_contact_bodies if contact_bodies == 'full' else NUM_FEET
+
     agent = env.to_epo_agent(
         num_latents = num_latents, dim_latent = dim_latent, actor_dim = actor_dim, actor_mlp_depth = actor_mlp_depth,
         critic_dim = critic_dim, critic_mlp_depth = critic_mlp_depth, use_critic_ema = False, clip_value = False,
@@ -1872,10 +2203,38 @@ def main(
         diversity_discr_kwargs = dict(dim = diversity_discr_dim, depth = diversity_discr_depth),
         diversity_discr_lr = diversity_discr_lr,
         actor_lr = learning_rate, critic_lr = learning_rate, batch_size = batch_size, max_grad_norm = max_grad_norm,
-        actor_loss_kwargs = dict(entropy_weight = entropy_weight, eps_clip = 0.2, norm_advantages = True, use_hpo = use_hpo), quiet = True,
+        actor_loss_kwargs = dict(
+            entropy_weight = entropy_weight, eps_clip = 0.2, norm_advantages = True, use_hpo = use_hpo, per_action_dim = per_action_dim,
+        ),
+        quiet = True,
     )
 
-    print(f'[SGS-gait] actor loss: {"HPO (x-ppo 0.0.21)" if use_hpo else "PPO clip"}')
+    contact_aux = None
+
+    if use_contact_aux:
+        contact_aux = AnticipatoryContactAux(
+            actor = agent.unwrap_model(agent.actor),
+            critic = agent.unwrap_model(agent.critic),
+            env = env,
+            actor_optim = agent.actor_optim,
+            critic_optim = agent.critic_optim,
+            num_bins = contact_num_bins,
+            bin_width = contact_bin_width,
+            num_contacts = contact_num_channels,
+            num_feet = NUM_FEET,
+            body_loss_share = contact_body_loss_share,
+            bin_mode = contact_bin_mode,
+            weight = contact_aux_weight,
+            max_grad_norm = max_grad_norm,
+            max_episode_length = horizon,
+        ).to(agent.device)
+
+        horizon_seconds = contact_num_bins * contact_bin_width * PHYSICS_DT * N_SUBSTEPS
+        print(f'[SGS-gait] anticipatory contact aux: {contact_num_channels} bodies ({contact_bodies}), '
+              f'{contact_num_bins} bins x {contact_bin_width} steps ({horizon_seconds:.2f}s), weight {contact_aux_weight}')
+
+    loss_name = 'HPO (x-ppo 0.0.27)' if use_hpo else 'PPO clip'
+    print(f'[SGS-gait] actor loss: {loss_name}, per_action_dim={per_action_dim}')
 
     diversity_note = f'DADS weight {diversity_reward_weight}' if use_diversity_discr else 'no DADS'
     fixed_note = f' ({dim_latent}d, {num_latents} sampled per cycle, {diversity_note})' if latent_mode == 'fixed' else ''
@@ -1957,7 +2316,7 @@ def main(
             epochs = distill_epochs, max_grad_norm = 1.0,
         )
 
-        print(f'[SGS-gait] online DAgger (x-ppo 0.0.21): no-CPG student ({student_env.obs_dim} obs / {student_env.action_dim} act)')
+        print(f'[SGS-gait] online DAgger (x-ppo 0.0.27): no-CPG student ({student_env.obs_dim} obs / {student_env.action_dim} act)')
 
     pbar = tqdm(total = total_env_steps, desc = 'SGS gait (single duck)', unit = 'step', unit_scale = True, dynamic_ncols = True)
     total_steps = cycle = 0
@@ -2000,6 +2359,7 @@ def main(
 
             t0 = time.perf_counter()
             _, fitness = agent.learn_from(rollout, epochs = epochs)
+            contact_stats = contact_aux.step(epochs = epochs, batch_size = batch_size) if exists(contact_aux) else {}
             t_learn = time.perf_counter() - t0
 
             mean_reward = float(rollout.cumulative_rewards.mean().item())
@@ -2039,6 +2399,7 @@ def main(
                 sgs_probs = np.round(probs, 4).tolist(), sgs_rates = np.round(np.nan_to_num(rates, nan = -1.0), 3).tolist(),
                 sgs_counts = counts.tolist(), episodes_done = int(env.sgs.sampler.step_count), **env.ep_stats,
                 dads_discr_loss = float(agent.last_diversity_discr_loss),
+                **contact_stats,
                 **dads_stats,
             )
 

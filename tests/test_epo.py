@@ -649,7 +649,7 @@ def test_continuous_beta_details():
     # 2. sampled action (sample = True)
     actions_sample, log_probs = agent.get_actor_actions(state, latent_id = 0, sample = True)
     assert actions_sample.shape == (4, 3)
-    assert log_probs.shape == (4,)
+    assert log_probs.shape == (4, 3)
     assert ((actions_sample >= -1.) & (actions_sample <= 1.)).all()
 
     # 3. temperature support
@@ -751,3 +751,37 @@ def test_learn_from_shuffles_each_epoch(monkeypatch, epochs):
     agent.learn_from(MemoriesAndCumulativeRewards(memories, torch.zeros(1, 2)), epochs = epochs)
 
     assert len(num_passes) == epochs # a fresh shuffled pass per epoch
+
+
+@pytest.mark.parametrize('per_action_dim', (False, True))
+def test_hpo_per_action_dim_continuous(per_action_dim):
+    agent = create_agent(
+        dim_state = 16,
+        num_latents = 1,
+        dim_latent = 0,
+        actor_num_actions = 6,
+        actor_dim = 16,
+        actor_mlp_depth = 2,
+        critic_dim = 16,
+        critic_mlp_depth = 2,
+        action_is_continuous = True,
+        use_critic_ema = False,
+        actor_loss_kwargs = dict(
+            use_hpo = True,
+            per_action_dim = per_action_dim,
+            eps_clip = 0.2,
+            entropy_weight = 0.002,
+            norm_advantages = True,
+        ),
+        wrap_with_accelerate = False,
+    )
+
+    epo = EPO(agent, episodes_per_latent = 4, max_episode_length = 8)
+    env = VectorEnv(state_shape = 16, num_envs = 4, can_terminate_after = 3)
+
+    rollout = epo.gather_experience_from(env)
+    real = [m for m in rollout.memories if int(m.episode_id) != -1]
+    assert all(m.log_prob.shape == (6,) for m in real)
+
+    agent.learn_from(rollout, epochs = 2)
+    env.close()
